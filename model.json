@@ -1,0 +1,12 @@
+{
+  "claude_code_path": "cc-binary/claude-2.1.169-linux-x64",
+  "default_model": "anthropic/claude-opus-4.8",
+  "default_effort": "max",
+  "phase_efforts": {
+    "phase1": "max",
+    "phase2": "medium",
+    "phase3": "max",
+    "phase5": "high",
+    "phase6": "high"
+  }
+}

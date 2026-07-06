@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tb-harbor-taskgen"
+version = "0.1.0"
+description = "TB Harbor task generation workflow tooling."
+requires-python = ">=3.10"
+dependencies = [
+    "tomli>=2.0.0; python_version < '3.11'",
+]
+
+[project.scripts]
+taskgen = "taskgen.cli:main"
+taskgen-claude-runner = "taskgen.claude.runner:main"
+taskgen-clean-intermediate = "taskgen.maintenance.clean_intermediate:main"
+taskgen-harbor-oracle-nop = "taskgen.harbor.oracle_nop:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

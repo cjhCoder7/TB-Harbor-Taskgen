@@ -1,0 +1,47 @@
+__pycache__/
+*.py[cod]
+
+# Local credentials and machine-specific environment
+scripts/env_init.sh
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.crt
+*.cer
+.agents/
+.codex/
+
+# Local Claude Code binary. Keep model.json pointing here, but do not commit
+# the downloaded executable.
+cc-binary/*
+!cc-binary/.gitkeep
+
+# Runtime workflow state. Keep only directory skeleton markers.
+runs/**/*
+!runs/**/
+!runs/**/.gitkeep
+
+generated/**/*
+!generated/**/
+!generated/**/.gitkeep
+
+# Local virtual environments and tool caches
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Editor, OS, and transient logs
+.DS_Store
+Thumbs.db
+*.swp
+*~
+*.log
+*.out
+*.err
+*.pid
