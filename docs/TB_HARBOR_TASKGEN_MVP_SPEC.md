@@ -1,4 +1,4 @@
-# TB-Harbor-Taskgen Developer Guide
+<h1 align="center">TB-Harbor-Taskgen Developer Guide</h1>
 
 <p align="center">
   <strong>English</strong>

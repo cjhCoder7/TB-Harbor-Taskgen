@@ -1,4 +1,4 @@
-# TB-Harbor-Taskgen 开发者指南
+<h1 align="center">TB-Harbor-Taskgen 开发者指南</h1>
 
 <p align="center">
   <a href="TB_HARBOR_TASKGEN_MVP_SPEC.md">English</a>

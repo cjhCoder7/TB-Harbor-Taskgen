@@ -1,4 +1,8 @@
-# TB-Harbor-Taskgen
+<h1 align="center">TB-Harbor-Taskgen</h1>
+
+<p align="center">
+  <img src="./assets/Framework-TB-Harbor-Taskgen.png" alt="Framework-of-TB-Harbor-Taskgen" style="max-width: 90%;">
+</p>
 
 <p align="center">
   <strong>从已有 seed task 出发，生成、检查、评审、修复并整理 TB3 Harbor 任务。</strong>
