@@ -1,7 +1,9 @@
 <h1 align="center">TB-Harbor-Taskgen</h1>
 
 <p align="center">
-  <img src="./assets/Framework-TB-Harbor-Taskgen.png" alt="Framework-of-TB-Harbor-Taskgen" style="max-width: 90%;">
+  <img src="./assets/Framework-TB-Harbor-Taskgen.png"
+       alt="Framework-of-TB-Harbor-Taskgen"
+       width="80%">
 </p>
 
 <p align="center">
