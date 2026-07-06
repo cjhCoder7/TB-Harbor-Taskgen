@@ -1,4 +1,4 @@
-# TB Harbor Taskgen Developer Guide
+# TB-Harbor-Taskgen Developer Guide
 
 <p align="center">
   <strong>English</strong>
@@ -6,14 +6,14 @@
   <a href="TB_HARBOR_TASKGEN_MVP_SPEC.zh-CN.md">简体中文</a>
 </p>
 
-This document describes the current implementation of `tb-harbor-taskgen` for
+This document describes the current implementation of TB-Harbor-Taskgen for
 developers who need to run, debug, or extend the project. It is intentionally
 implementation-aligned: when behavior changes in code, update this guide in the
 same change.
 
 ## 1. Project Scope
 
-`tb-harbor-taskgen` turns one Terminal-Bench Harbor seed task into one or more
+TB-Harbor-Taskgen turns one Terminal-Bench Harbor seed task into one or more
 generated TB3 Harbor task candidates. The workflow is phase-based:
 
 1. Read a seed task and brainstorm task ideas.

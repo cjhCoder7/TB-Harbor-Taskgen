@@ -1,4 +1,4 @@
-# TB Harbor Taskgen 开发者指南
+# TB-Harbor-Taskgen 开发者指南
 
 <p align="center">
   <a href="TB_HARBOR_TASKGEN_MVP_SPEC.md">English</a>
@@ -6,11 +6,11 @@
   <strong>简体中文</strong>
 </p>
 
-本文档说明 `tb-harbor-taskgen` 当前代码实现，面向需要运行、调试或扩展项目的开发者。文档以代码为准；如果行为在代码中变化，应在同一改动中更新本文档。
+本文档说明 TB-Harbor-Taskgen 当前代码实现，面向需要运行、调试或扩展项目的开发者。文档以代码为准；如果行为在代码中变化，应在同一改动中更新本文档。
 
 ## 1. 项目范围
 
-`tb-harbor-taskgen` 将一个 Terminal-Bench Harbor seed task 转换为一个或多个生成的 TB3 Harbor task candidate。工作流按 phase 组织：
+TB-Harbor-Taskgen 将一个 Terminal-Bench Harbor seed task 转换为一个或多个生成的 TB3 Harbor task candidate。工作流按 phase 组织：
 
 1. 读取 seed task 并生成任务思路。
 2. 为每个思路检索 SkillNet 证据。

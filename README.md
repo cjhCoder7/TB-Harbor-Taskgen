@@ -1,4 +1,4 @@
-# TB Harbor Taskgen
+# TB-Harbor-Taskgen
 
 <p align="center">
   <strong>Generate, check, review, repair, and finalize TB3 Harbor tasks from existing seed tasks.</strong>
@@ -18,7 +18,7 @@
   <a href="README.zh-CN.md">简体中文</a>
 </p>
 
-TB Harbor Taskgen is a local workflow for turning one read-only Terminal-Bench
+TB-Harbor-Taskgen is a local workflow for turning one read-only Terminal-Bench
 Harbor seed task into multiple synthetic TB3 task candidates. The pipeline uses
 Claude Code for creative generation and review, injects curated external
 knowledge as task-specific Claude Code skills, then gates generated tasks with

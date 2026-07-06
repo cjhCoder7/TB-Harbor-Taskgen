@@ -1,4 +1,4 @@
-# TB Harbor Taskgen
+# TB-Harbor-Taskgen
 
 <p align="center">
   <strong>从已有 seed task 出发，生成、检查、评审、修复并整理 TB3 Harbor 任务。</strong>
@@ -18,7 +18,7 @@
   <strong>简体中文</strong>
 </p>
 
-TB Harbor Taskgen 是一个本地任务生成流水线。它从一个只读 Terminal-Bench Harbor seed task 出发，生成多个合成的 TB3 task candidates。流水线使用 Claude Code 完成创意生成和评审，把外部知识整理成 task-specific Claude Code skills 注入生成 workspace，再通过 Harbor oracle/nop 检查作为动态 gate，最后把任务整理到 accepted 或 rejected 产物目录。
+TB-Harbor-Taskgen 是一个本地任务生成流水线。它从一个只读 Terminal-Bench Harbor seed task 出发，生成多个合成的 TB3 task candidates。流水线使用 Claude Code 完成创意生成和评审，把外部知识整理成 task-specific Claude Code skills 注入生成 workspace，再通过 Harbor oracle/nop 检查作为动态 gate，最后把任务整理到 accepted 或 rejected 产物目录。
 
 实现细节见 [开发者指南](docs/TB_HARBOR_TASKGEN_MVP_SPEC.zh-CN.md)。
 
