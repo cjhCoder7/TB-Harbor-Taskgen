@@ -65,7 +65,8 @@ TB3 format checklist:
 - `task.toml`: verifier uses `environment_mode = "separate"`; agent timeout is integer-valued; environment has build timeout, CPU, memory, storage, GPU, and internet fields.
 - `difficulty_explanation`: explicitly describes the main logic complexity and expected implementation/edit scope.
 - `instruction.md`: concise, human-edited, absolute paths only, final outcome only, no role/thinking prompts or solution/tool nudges, and exact TB3 suffix.
-- `instruction.md`: avoid lengthy, highly polished Markdown with formal `##` sectioning; keep it natural and compact so it does not read like an unreviewed LLM-synthesized task brief.
+- `instruction.md`: avoid lengthy, highly polished Markdown with formal `#` or `##` sectioning; keep it natural and compact so it does not read like an unreviewed LLM-synthesized task brief.
+- `instruction.md`: write prose as natural paragraphs, not hard-wrapped Markdown source. Do not split one paragraph across multiple physical lines at 80 or 90 columns.
 - `environment/`: agent-visible starting state only; never copies `solution/` or `tests/`.
 - `solution/solve.sh`: real oracle solution from the same visible starting state.
 - `tests/`: separate verifier image; tests verify outcomes and write reward without depending on command order, exact library choice, or oracle-only details.

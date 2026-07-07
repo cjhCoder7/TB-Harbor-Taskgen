@@ -61,6 +61,7 @@ TB3 repair checklist:
 
 - Keep the task tree complete and TB3-compatible.
 - Keep `instruction.md` concise, outcome-focused, absolute-path based, artifact-complete, and free of solution steps, command sequences, tool nudges, role prompts, or thinking prompts.
+- Keep `instruction.md` prose natural: do not hard-wrap paragraphs at 80 or 90 columns; each paragraph should be one physical line, with blank lines between paragraphs and bullets only when genuinely useful.
 - Keep the required TB3 suffix, with `N` exactly equal to `[agent].timeout_sec`.
 - Keep `task.toml` artifacts, metadata, verifier mode, agent timeout, and environment resources aligned with the repaired task.
 - Keep `environment/` as the agent-visible starting state only; never copy `solution/` or `tests/` into the agent image.

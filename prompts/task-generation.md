@@ -69,7 +69,8 @@ TB3 format checklist:
 - `task.toml`: leave synthetic author identity and relevant experience fields empty unless truthful values are explicitly provided; choose non-empty `category` and `tags` from the task content.
 - `task.toml`: `[verifier] environment_mode = "separate"` with positive `timeout_sec`; `[agent] timeout_sec` is integer-valued; `[environment]` has `build_timeout_sec`, `cpus`, `memory_mb`, `storage_mb`, `gpus`, and `allow_internet = true`.
 - `instruction.md`: concise, human-edited, absolute paths only, mentions every artifact, states final observable outcome, and does not describe solution steps, command order, role prompts, thinking prompts, or tool nudges.
-- `instruction.md`: avoid polished long-form Markdown structure. Do not write a lengthy task description with formal `##` sectioning; that style looks purely LLM-synthesized and insufficiently human-checked.
+- `instruction.md`: avoid polished long-form Markdown structure. Do not write a lengthy task description with formal `#` or `##` sectioning; that style looks purely LLM-synthesized and insufficiently human-checked.
+- `instruction.md`: write prose as natural paragraphs. Do not hard-wrap a paragraph at 80 or 90 columns; each paragraph should stay on one physical line, with blank lines between paragraphs and bullets only when genuinely useful.
 - `instruction.md`: ends with exactly one blank line plus the required TB3 suffix, where `N` equals `[agent].timeout_sec`.
 - `environment/`: only the agent-visible starting state; never copies `solution/` or `tests/`.
 - `solution/solve.sh`: real oracle solution from the same visible starting state; every external command exists in the agent image or is installed before use.
