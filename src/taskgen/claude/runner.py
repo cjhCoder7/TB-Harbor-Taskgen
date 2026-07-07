@@ -23,6 +23,16 @@ from taskgen.config import (
 
 
 PERMISSION_ARGS = ("--permission-mode", "bypassPermissions")
+DISALLOWED_TOOL_ARGS = (
+    "--disallowedTools",
+    "Bash(*find / *)",
+    "Bash(*find /)",
+    "Bash(*grep -R / *)",
+    "Bash(*grep -r / *)",
+    "Bash(*rg / *)",
+    "Bash(*rg --files / *)",
+    "Bash(*locate *)",
+)
 
 
 def executable_candidates(root: Path) -> list[Path]:
@@ -69,6 +79,7 @@ def build_claude_command(root: Path, model: str | None, effort: str | None, prom
         command.extend(["--model", model])
     if effort:
         command.extend(["--effort", effort])
+    command.extend(DISALLOWED_TOOL_ARGS)
     command.extend([*PERMISSION_ARGS, "--print", "--", prompt])
     return command
 

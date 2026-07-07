@@ -19,6 +19,7 @@ from taskgen.claude.cost import OpenRouterQueryError
 from taskgen.claude.cost import parse_claude_stream_log
 from taskgen.claude.cost import format_cost_summary
 from taskgen.claude.cost import summarize_claude_stream_log
+from taskgen.claude.runner import build_claude_command
 from taskgen.claude.workspace import (
     phase_input_paths,
     phase_output_paths,
@@ -143,6 +144,29 @@ class ModelConfigTests(unittest.TestCase):
 
             with self.assertRaises(SystemExit):
                 load_model_config(root)
+
+
+class ClaudeRunnerTests(unittest.TestCase):
+    def test_claude_command_blocks_full_filesystem_scans(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            binary = root / "cc-binary/claude-test"
+            binary.parent.mkdir()
+            binary.write_text("#!/bin/sh\n", encoding="utf-8")
+            os.chmod(binary, 0o755)
+            (root / "model.json").write_text(
+                json.dumps({"claude_code_path": "cc-binary/claude-test"}),
+                encoding="utf-8",
+            )
+
+            command = build_claude_command(root, "claude-opus-4-8", "high", "prompt")
+
+        self.assertIn("--disallowedTools", command)
+        self.assertIn("Bash(*find / *)", command)
+        self.assertIn("Bash(*grep -R / *)", command)
+        self.assertIn("Bash(*rg --files / *)", command)
+        self.assertIn("Bash(*locate *)", command)
+        self.assertLess(command.index("--disallowedTools"), command.index("--print"))
 
 
 class PipelineTests(unittest.TestCase):
