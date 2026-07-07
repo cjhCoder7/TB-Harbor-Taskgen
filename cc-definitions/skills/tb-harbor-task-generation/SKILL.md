@@ -23,6 +23,7 @@ Use this skill for TB3 task creation and quality checks inside isolated workspac
 - Do not create difficulty through long prompts, arbitrary formatting traps, ambiguity, randomness, blocked networking, low timeouts, excessive resources, or hidden gotchas.
 - User-visible paths in task instructions should be container-absolute, for example `/app/input.csv`, not `./input.csv`.
 - Instructions should describe final state and acceptance criteria, not a step-by-step solution.
+- Instructions should be compact and natural. Avoid lengthy, highly polished Markdown with formal `##` sectioning because it suggests pure LLM synthesis without enough human review.
 - Verifiers should check outcomes, not exact command order, oracle implementation details, or library choice.
 
 ## Seed Brainstorm
@@ -269,7 +270,7 @@ TB3 format checklist:
 - `task.toml` declares container-absolute artifacts, complete metadata, separate verifier, integer-valued agent timeout, and full environment resource fields.
 - `difficulty_explanation` states the task's logic complexity and expected implementation/artifact edit scope.
 - Synthetic author identity fields stay empty unless truthful values are provided; category and tags are non-empty.
-- `instruction.md` is concise, outcome-focused, absolute-path based, artifact-complete, and ends with the exact TB3 suffix.
+- `instruction.md` is concise, outcome-focused, absolute-path based, artifact-complete, avoids lengthy formal `##` sectioning, and ends with the exact TB3 suffix.
 - `environment/` contains only the starting state; `solution/` and `tests/` are never copied into the agent image.
 - `solution/solve.sh` solves from the visible starting state.
 - `tests/` is a separate verifier image that checks outcomes and writes reward without relying on command order, exact library choice, or oracle-only details.

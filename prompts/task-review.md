@@ -58,6 +58,7 @@ Quality checklist:
 - Benchmark suitability: the task is a benchmark item, not an agent prompt; it is realistic, fair, deterministic, and free of real credentials, API keys, private data, or unsafe instructions.
 - TB3 structure: required files/directories exist; `task.toml` has top-level artifacts, complete metadata, separate verifier, integer-valued agent timeout, and environment resource fields; declared artifacts align with `instruction.md`.
 - Instruction quality: concise, direct, human-edited, absolute-path based, outcome-focused, no solution steps/tool nudges/role prompts/thinking prompts, and exact TB3 suffix with `N == [agent].timeout_sec`.
+- Instruction quality: do not accept a lengthy, highly polished Markdown description with formal `##` sectioning; treat it as a likely pure LLM synthesis artifact that should be shortened and made more natural before delivery.
 - Environment and solution: agent image contains only the starting state, never copies `solution/` or `tests/`, is reproducible, and the reference solution solves from the same visible starting state with tools available in the agent image.
 - Verifier quality: separate verifier image, verifier-only files and dependencies stay in `tests/Dockerfile`, tests check externally visible outcomes and write reward, and reward hacking is resisted.
 - Dynamic evidence: if oracle/nop validation passed, oracle reward is exactly `1.0` and nop reward is exactly `0.0`; if it failed, the review must explain the failure and choose `needs_modification` when the issue is fixable.
