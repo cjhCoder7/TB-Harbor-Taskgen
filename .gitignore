@@ -29,6 +29,11 @@ generated/**/*
 !generated/**/
 !generated/**/.gitkeep
 
+# Local seed task inputs. Keep only directory skeleton markers.
+seeds/**/*
+!seeds/**/
+!seeds/**/.gitkeep
+
 # Local virtual environments and tool caches
 .venv/
 venv/
