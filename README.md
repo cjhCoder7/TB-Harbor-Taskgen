@@ -184,6 +184,19 @@ optionally the Claude Code binary:
 `cc-binary/`. Keep this relative path aligned with the binary available on the
 machine that runs the pipeline. The downloaded executable is not committed.
 
+To download the Claude Code binary into a specific directory, change
+`CLAUDE_BIN_DIR` to the target location:
+
+```bash
+CLAUDE_VERSION=2.1.169 CLAUDE_PLATFORM=linux-x64 CLAUDE_BIN_DIR=cc-binary
+mkdir -p "$CLAUDE_BIN_DIR" && curl -fsSL "https://downloads.claude.ai/claude-code-releases/${CLAUDE_VERSION}/${CLAUDE_PLATFORM}/claude" -o "$CLAUDE_BIN_DIR/claude-${CLAUDE_VERSION}-${CLAUDE_PLATFORM}" && chmod +x "$CLAUDE_BIN_DIR/claude-${CLAUDE_VERSION}-${CLAUDE_PLATFORM}"
+```
+
+If you downloaded the binary to a non-default path, update `claude_code_path` in
+`model.json` to match. `CLAUDE_PLATFORM` must match the machine that runs the
+pipeline; common values include `linux-x64`, `linux-arm64`, `linux-x64-musl`,
+and `linux-arm64-musl`.
+
 Supported effort values:
 
 ```text

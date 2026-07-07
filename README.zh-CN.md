@@ -173,6 +173,15 @@ Claude Code binary：
 
 `claude_code_path` 指向 `cc-binary/` 下的本地 Claude Code 可执行文件。请保持这个相对路径与运行机器上的实际 binary 一致；下载的可执行文件不提交到仓库。
 
+如果需要把 Claude Code binary 下载到指定目录，可以把 `CLAUDE_BIN_DIR` 改成目标目录：
+
+```bash
+CLAUDE_VERSION=2.1.169 CLAUDE_PLATFORM=linux-x64 CLAUDE_BIN_DIR=cc-binary
+mkdir -p "$CLAUDE_BIN_DIR" && curl -fsSL "https://downloads.claude.ai/claude-code-releases/${CLAUDE_VERSION}/${CLAUDE_PLATFORM}/claude" -o "$CLAUDE_BIN_DIR/claude-${CLAUDE_VERSION}-${CLAUDE_PLATFORM}" && chmod +x "$CLAUDE_BIN_DIR/claude-${CLAUDE_VERSION}-${CLAUDE_PLATFORM}"
+```
+
+如果下载到了非默认路径，请同步更新 `model.json` 里的 `claude_code_path`。`CLAUDE_PLATFORM` 需要和运行机器一致；常见值包括 `linux-x64`、`linux-arm64`、`linux-x64-musl` 和 `linux-arm64-musl`。
+
 支持的 effort values：
 
 ```text
