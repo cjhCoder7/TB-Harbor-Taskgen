@@ -61,6 +61,7 @@ Quality checklist:
 - Instruction quality: do not accept a lengthy, highly polished Markdown description with formal `#` or `##` sectioning; treat it as a likely pure LLM synthesis artifact that should be shortened and made more natural before delivery.
 - Instruction quality: do not accept prose that is hard-wrapped at 80 or 90 columns inside a paragraph; request natural paragraphs where each paragraph is one physical line, separated by blank lines.
 - Environment and solution: agent image contains only the starting state, never copies `solution/` or `tests/`, is reproducible, and the reference solution solves from the same visible starting state with tools available in the agent image.
+- Environment comments: visible environment files must not contain explanatory comments, docstrings, inline hints, known-defect notes, TODO/FIXME markers, or prose that helps the agent infer the intended fix.
 - Verifier quality: separate verifier image, verifier-only files and dependencies stay in `tests/Dockerfile`, tests check externally visible outcomes and write reward, and reward hacking is resisted.
 - Dynamic evidence: if oracle/nop validation passed, oracle reward is exactly `1.0` and nop reward is exactly `0.0`; if it failed, the review must explain the failure and choose `needs_modification` when the issue is fixable.
 - Cleanliness: no generated/validation artifacts, caches, bytecode, transient logs, prompts, temporary workspace files, or leaked copied inputs remain in the task directory.
