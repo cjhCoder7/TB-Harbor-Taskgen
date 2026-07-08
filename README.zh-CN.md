@@ -86,6 +86,12 @@ scripts/taskgen.sh phases
 scripts/taskgen.sh pipeline <seed_id>
 ```
 
+在进入后续阶段前指定 phase1 需要生成的 idea 数量：
+
+```bash
+scripts/taskgen.sh pipeline <seed_id> --idea-count 4
+```
+
 只运行一个 idea，并允许最多两轮自动 repair：
 
 ```bash
@@ -123,7 +129,7 @@ flowchart LR
 
 | Phase | 作用 | 主要输出 |
 | --- | --- | --- |
-| `phase1` | 读取一个 seed，生成 3-5 个带显式难度 profile 的 task ideas。 | `runs/brainstorm/<seed_id>/seed_brainstorm.json` |
+| `phase1` | 读取一个 seed，生成可配置数量的带显式难度 profile 的 task ideas。 | `runs/brainstorm/<seed_id>/seed_brainstorm.json` |
 | `phase2` | 检索 SkillNet，并为每个 idea 整理 skill packages 和 difficulty-hardening 指导。 | `runs/skillnet/<seed_id>/` |
 | `phase3` | 为一个 idea 生成完整 TB3 Harbor task directory。 | `generated/working/<seed_id>/<idea_id>/` |
 | `phase4` | 运行 Harbor oracle 和 nop 检查。 | `runs/oracle-nop-check/<task_id>/oracle-nop-status.json` |

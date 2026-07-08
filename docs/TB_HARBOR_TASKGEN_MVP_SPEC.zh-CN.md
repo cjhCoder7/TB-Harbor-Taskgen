@@ -120,7 +120,7 @@ scripts/taskgen.sh run <phase> <seed_id> [--idea-id <idea_id>] [--dry-run]
 scripts/taskgen.sh validate <phase> <seed_id> [--idea-id <idea_id>] [--json]
 ```
 
-`phase3` 到 `phase7` 必须传 `--idea-id`。`phase1` 和 `phase2` 不接受 `--idea-id`。
+`phase3` 到 `phase7` 必须传 `--idea-id`。`phase1` 和 `phase2` 不接受 `--idea-id`。单独运行 `phase1` 时也可以传 `--idea-count N` 来请求并校验精确的 brainstorm idea 数量。
 
 Claude-backed phases 支持 `--model` 和 `--effort`：`phase1`、`phase2`、`phase3`、`phase5`、`phase6`。
 
@@ -129,6 +129,7 @@ Claude-backed phases 支持 `--model` 和 `--effort`：`phase1`、`phase2`、`ph
 ```bash
 scripts/taskgen.sh pipeline <seed_id> \
   [--idea-id <idea_id>] \
+  [--idea-count N] \
   [--max-repairs N] \
   [--force] \
   [--continue-on-error] \
@@ -137,7 +138,7 @@ scripts/taskgen.sh pipeline <seed_id> \
   [--effort <effort>]
 ```
 
-pipeline 先运行 phase1 和 phase2，然后处理指定 idea 或 phase1 输出中的全部 ideas。已通过当前验证的 phase 会被跳过，除非传入 `--force`。如果 phase5 返回 `needs_modification`，pipeline 会运行 phase6，然后强制重跑 phase4 和 phase5，直到评审结果为 `ready`、`rejected`，或 repair budget 用完。
+pipeline 先运行 phase1 和 phase2，然后处理指定 idea 或 phase1 输出中的全部 ideas。`--idea-count` 会请求并校验 phase1 brainstorm 的精确 idea 数量；如果已有 phase1 输出数量不同，phase1 会重跑。除此之外，已通过当前验证的 phase 会被跳过，除非传入 `--force`。如果 phase5 返回 `needs_modification`，pipeline 会运行 phase6，然后强制重跑 phase4 和 phase5，直到评审结果为 `ready`、`rejected`，或 repair budget 用完。
 
 ## 6. 产物布局
 

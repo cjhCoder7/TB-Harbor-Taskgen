@@ -26,10 +26,10 @@ from taskgen.claude.workspace import (
     prepare_workspace,
     sync_workspace_outputs,
 )
-from taskgen.cli import load_pipeline_idea_ids
+from taskgen.cli import build_phase_process_command, get_phase, load_pipeline_idea_ids, pipeline_phase1_count_matches
 from taskgen.config import load_model_config, resolve_claude_code_path, resolve_effort_level
 from taskgen.common import ValidationReport
-from taskgen.phases.phase1_seed_brainstorm import validate_brainstorm_data
+from taskgen.phases.phase1_seed_brainstorm import render_phase1_prompt, validate_brainstorm_data
 from taskgen.phases.phase2_skillnet_research import validate_phase2
 from taskgen.phases.phase3_task_generation import render_phase3_prompt, validate_phase3
 from taskgen.phases.phase4_oracle_nop_check import (
@@ -190,6 +190,27 @@ class PipelineTests(unittest.TestCase):
             )
 
             self.assertEqual(load_pipeline_idea_ids(project, "seed-a"), ["idea-1", "idea-2"])
+            self.assertTrue(pipeline_phase1_count_matches(project, "seed-a", 2))
+            self.assertFalse(pipeline_phase1_count_matches(project, "seed-a", 3))
+
+    def test_builds_phase1_command_with_idea_count(self) -> None:
+        command = build_phase_process_command(
+            get_phase("phase1"),
+            "run",
+            "seed-a",
+            idea_count=4,
+        )
+
+        self.assertEqual(command[-2:], ["--idea-count", "4"])
+
+    def test_rejects_idea_count_for_non_phase1_command(self) -> None:
+        with self.assertRaises(SystemExit):
+            build_phase_process_command(
+                get_phase("phase2"),
+                "run",
+                "seed-a",
+                idea_count=4,
+            )
 
 
 class ClaudeWorkspaceTests(unittest.TestCase):
@@ -547,6 +568,37 @@ class ClaudeCostTests(unittest.TestCase):
 
 
 class Phase1ValidationTests(unittest.TestCase):
+    def test_render_phase1_prompt_uses_exact_idea_count(self) -> None:
+        with tempfile.TemporaryDirectory() as project_tmp:
+            project = Path(project_tmp)
+            (project / "prompts").mkdir()
+            (project / "prompts/seed-brainstorm.md").write_text(
+                "{{SEED_ID}}\n{{SEED_PATH}}\n{{IDEA_COUNT_REQUIREMENT}}\n",
+                encoding="utf-8",
+            )
+
+            prompt_path = render_phase1_prompt(project, "seed-a", 4)
+
+            prompt = prompt_path.read_text(encoding="utf-8")
+            self.assertIn("seed-a", prompt)
+            self.assertIn("seed/seed-a", prompt)
+            self.assertIn("Produce exactly 4 substantially different TB3 task ideas.", prompt)
+            self.assertIn("must contain exactly 4 items", prompt)
+
+    def test_render_phase1_prompt_uses_default_idea_count_when_unspecified(self) -> None:
+        with tempfile.TemporaryDirectory() as project_tmp:
+            project = Path(project_tmp)
+            (project / "prompts").mkdir()
+            (project / "prompts/seed-brainstorm.md").write_text(
+                "{{IDEA_COUNT_REQUIREMENT}}\n",
+                encoding="utf-8",
+            )
+
+            prompt_path = render_phase1_prompt(project, "seed-a")
+
+            prompt = prompt_path.read_text(encoding="utf-8")
+            self.assertIn("Produce 3-5 substantially different TB3 task ideas by default.", prompt)
+
     def test_allows_more_than_five_ideas(self) -> None:
         report = ValidationReport(phase="phase1", seed_id="seed-a")
         idea = {
@@ -575,6 +627,35 @@ class Phase1ValidationTests(unittest.TestCase):
         validate_brainstorm_data(data, "seed-a", report)
 
         self.assertEqual(report.errors, [])
+
+    def test_rejects_wrong_idea_count_when_expected(self) -> None:
+        report = ValidationReport(phase="phase1", seed_id="seed-a")
+        idea = {
+            "title": "Title",
+            "scenario": "Scenario",
+            "core_transfer": "Transfer",
+            "changed_dimensions": ["artifact", "scenario"],
+            "expected_artifacts": ["/app/output.txt"],
+            "verifier_sketch": "Check the output.",
+            "risk_notes": ["Risk"],
+            "skillnet_queries": ["query"],
+            "difficulty_profile": difficulty_profile_fixture(),
+        }
+        data = {
+            "seed_id": "seed-a",
+            "source_path": "seed/seed-a",
+            "task_understanding": "Understanding",
+            "core_capabilities": ["Capability"],
+            "ideas": [
+                {"idea_id": "idea-1", **idea},
+                {"idea_id": "idea-2", **idea},
+            ],
+            "avoid": ["Avoid"],
+        }
+
+        validate_brainstorm_data(data, "seed-a", report, expected_idea_count=3)
+
+        self.assertIn("$.ideas must contain exactly 3 idea(s), got 2", report.errors)
 
     def test_rejects_non_path_safe_idea_id(self) -> None:
         report = ValidationReport(phase="phase1", seed_id="seed-a")

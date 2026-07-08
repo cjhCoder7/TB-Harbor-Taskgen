@@ -8,6 +8,7 @@ Inputs:
 
 - Seed id: `{{SEED_ID}}`
 - Seed path: `{{SEED_PATH}}`
+- Idea count requirement: {{IDEA_COUNT_REQUIREMENT}}
 
 Goal:
 
@@ -31,7 +32,7 @@ Required work:
 1. Read `{{SEED_PATH}}` as read-only input.
 2. Understand the seed goal, visible starting environment, reference solution, verifier behavior, reward path, hidden ground truth boundaries, and likely failure modes.
 3. Treat the seed as a capability source only. Many seeds are TB2 or older Harbor tasks; do not copy their task format, story, wording, fixtures, answers, verifier logic, or distinctive surface assets.
-4. Produce 3-5 substantially different TB3 task ideas by default. The validator allows more ideas, but every idea must be concrete and useful.
+4. {{IDEA_COUNT_REQUIREMENT}}
 5. Write only `output/seed_brainstorm.json`.
 6. Stop.
 

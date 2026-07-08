@@ -45,6 +45,16 @@ BRAINSTORM_FILENAME = "seed_brainstorm.json"
 IDEA_ID_RE = re.compile(r"[A-Za-z0-9._-]+")
 
 
+def positive_int_arg(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("--idea-count must be an integer >= 1") from exc
+    if parsed < 1:
+        raise argparse.ArgumentTypeError("--idea-count must be an integer >= 1")
+    return parsed
+
+
 def validate_seed_id(seed_id: str) -> list[str]:
     return validate_path_segment(seed_id, "seed_id")
 
@@ -135,12 +145,25 @@ def ensure_phase1_inputs(root: Path, seed_id: str) -> list[str]:
     return errors
 
 
-def render_phase1_prompt(root: Path, seed_id: str) -> Path:
+def idea_count_requirement(idea_count: int | None) -> str:
+    if idea_count is None:
+        return (
+            "Produce 3-5 substantially different TB3 task ideas by default. "
+            "The validator allows more ideas, but every idea must be concrete and useful."
+        )
+    return (
+        f"Produce exactly {idea_count} substantially different TB3 task ideas. "
+        f"The `ideas` array must contain exactly {idea_count} items."
+    )
+
+
+def render_phase1_prompt(root: Path, seed_id: str, idea_count: int | None = None) -> Path:
     template_path = root / "prompts/seed-brainstorm.md"
     output_path = root / "runs/prompts" / seed_id / "seed-brainstorm.md"
     prompt = template_path.read_text(encoding="utf-8")
     prompt = prompt.replace("{{SEED_ID}}", seed_id)
     prompt = prompt.replace("{{SEED_PATH}}", workspace_seed_ref_for(seed_id))
+    prompt = prompt.replace("{{IDEA_COUNT_REQUIREMENT}}", idea_count_requirement(idea_count))
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(prompt, encoding="utf-8")
     return output_path
@@ -226,7 +249,13 @@ def validate_seed_layout(root: Path, seed_id: str, report: ValidationReport) -> 
             report.errors.append(f"missing seed directory: {candidate}")
 
 
-def validate_brainstorm_data(data: dict[str, Any], seed_id: str, report: ValidationReport) -> None:
+def validate_brainstorm_data(
+    data: dict[str, Any],
+    seed_id: str,
+    report: ValidationReport,
+    *,
+    expected_idea_count: int | None = None,
+) -> None:
     actual_seed_id = require_string(data, "seed_id", "$", report)
     if actual_seed_id is not None and actual_seed_id != seed_id:
         report.errors.append(f"$.seed_id must equal {seed_id!r}, got {actual_seed_id!r}")
@@ -239,16 +268,25 @@ def validate_brainstorm_data(data: dict[str, Any], seed_id: str, report: Validat
     require_string(data, "task_understanding", "$", report)
     require_string_list(data, "core_capabilities", "$", report, min_items=1)
     require_string_list(data, "avoid", "$", report, min_items=1)
-    validate_ideas(data.get("ideas"), report)
+    validate_ideas(data.get("ideas"), report, expected_idea_count=expected_idea_count)
 
 
-def validate_ideas(ideas: Any, report: ValidationReport) -> None:
+def validate_ideas(
+    ideas: Any,
+    report: ValidationReport,
+    *,
+    expected_idea_count: int | None = None,
+) -> None:
     if not isinstance(ideas, list):
         report.errors.append("$.ideas must be a list")
         return
 
     if not ideas:
         report.errors.append("$.ideas must contain at least 1 idea")
+    if expected_idea_count is not None and len(ideas) != expected_idea_count:
+        report.errors.append(
+            f"$.ideas must contain exactly {expected_idea_count} idea(s), got {len(ideas)}"
+        )
 
     seen_idea_ids: set[str] = set()
     for index, idea_value in enumerate(ideas):
@@ -312,7 +350,13 @@ def require_positive_int(
     return value
 
 
-def validate_phase1(root: Path, seed_id: str, *, require_manifest: bool = True) -> ValidationReport:
+def validate_phase1(
+    root: Path,
+    seed_id: str,
+    *,
+    require_manifest: bool = True,
+    expected_idea_count: int | None = None,
+) -> ValidationReport:
     report = ValidationReport(phase=PHASE_KEY, seed_id=seed_id)
 
     seed_errors = validate_seed_id(seed_id)
@@ -329,7 +373,7 @@ def validate_phase1(root: Path, seed_id: str, *, require_manifest: bool = True) 
     if data is None:
         return report
 
-    validate_brainstorm_data(data, seed_id, report)
+    validate_brainstorm_data(data, seed_id, report, expected_idea_count=expected_idea_count)
 
     if require_manifest:
         validate_manifest_event(root, seed_id, brainstorm_ref, report)
@@ -365,7 +409,7 @@ def command_run(args: argparse.Namespace) -> int:
             print(f"- {error}", file=sys.stderr)
         return 1
 
-    prompt_path = render_phase1_prompt(root, args.seed_id)
+    prompt_path = render_phase1_prompt(root, args.seed_id, args.idea_count)
     model = resolve_model_name(root, args.model)
     effort = resolve_effort_level(root, args.effort, PHASE_KEY)
     command = build_claude_command(root, args.seed_id, prompt_path, model, effort)
@@ -382,7 +426,12 @@ def command_run(args: argparse.Namespace) -> int:
 
     print()
     print("validating phase1 brainstorm output...")
-    brainstorm_report = validate_phase1(root, args.seed_id, require_manifest=False)
+    brainstorm_report = validate_phase1(
+        root,
+        args.seed_id,
+        require_manifest=False,
+        expected_idea_count=args.idea_count,
+    )
     brainstorm_exit_code = print_report(brainstorm_report, as_json=False)
     if brainstorm_exit_code != 0:
         return brainstorm_exit_code
@@ -396,7 +445,10 @@ def command_run(args: argparse.Namespace) -> int:
 
     print()
     print("validating phase1 manifest...")
-    return print_report(validate_phase1(root, args.seed_id), as_json=False)
+    return print_report(
+        validate_phase1(root, args.seed_id, expected_idea_count=args.idea_count),
+        as_json=False,
+    )
 
 
 def command_validate(args: argparse.Namespace) -> int:
@@ -415,6 +467,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Render the prompt and print the command without running Claude or validation.",
     )
     run.add_argument("--model", help="Claude model to use. Defaults to model.json default_model when omitted.")
+    run.add_argument(
+        "--idea-count",
+        type=positive_int_arg,
+        help="Exact number of brainstorm ideas to request and validate for this phase1 run.",
+    )
     run.add_argument(
         "--effort",
         choices=EFFORT_LEVELS,

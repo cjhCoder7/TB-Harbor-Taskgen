@@ -136,7 +136,8 @@ scripts/taskgen.sh validate <phase> <seed_id> [--idea-id <idea_id>] [--json]
 ```
 
 `phase3` through `phase7` require `--idea-id`. `phase1` and `phase2` reject
-`--idea-id`.
+`--idea-id`. `phase1` run commands also accept `--idea-count N` to request and
+validate an exact brainstorm idea count.
 
 Claude-backed phases accept `--model` and `--effort`: `phase1`, `phase2`,
 `phase3`, `phase5`, `phase6`.
@@ -146,6 +147,7 @@ Claude-backed phases accept `--model` and `--effort`: `phase1`, `phase2`,
 ```bash
 scripts/taskgen.sh pipeline <seed_id> \
   [--idea-id <idea_id>] \
+  [--idea-count N] \
   [--max-repairs N] \
   [--force] \
   [--continue-on-error] \
@@ -155,7 +157,9 @@ scripts/taskgen.sh pipeline <seed_id> \
 ```
 
 The pipeline runs phase1 and phase2 first, then processes either the requested
-idea or every idea listed in phase1 output. Existing valid phases are skipped
+idea or every idea listed in phase1 output. `--idea-count` requests and validates
+an exact phase1 brainstorm idea count; when existing phase1 output has a
+different count, phase1 is rerun. Existing valid phases are otherwise skipped
 unless `--force` is set. When phase5 returns `needs_modification`, the pipeline
 runs phase6 and then forces phase4 and phase5 again until the review decision is
 `ready`, `rejected`, or the repair budget is exhausted.

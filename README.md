@@ -94,6 +94,12 @@ Run the full pipeline for every idea under a seed:
 scripts/taskgen.sh pipeline <seed_id>
 ```
 
+Request an exact number of brainstorm ideas before downstream processing:
+
+```bash
+scripts/taskgen.sh pipeline <seed_id> --idea-count 4
+```
+
 Run only one idea, allowing up to two automatic repair rounds:
 
 ```bash
@@ -131,7 +137,7 @@ flowchart LR
 
 | Phase | Purpose | Main Output |
 | --- | --- | --- |
-| `phase1` | Read one seed and produce 3-5 distinct task ideas with an explicit difficulty profile. | `runs/brainstorm/<seed_id>/seed_brainstorm.json` |
+| `phase1` | Read one seed and produce configurable distinct task ideas with an explicit difficulty profile. | `runs/brainstorm/<seed_id>/seed_brainstorm.json` |
 | `phase2` | Research SkillNet and curate per-idea skill packages plus difficulty-hardening guidance. | `runs/skillnet/<seed_id>/` |
 | `phase3` | Generate one complete TB3 Harbor task directory. | `generated/working/<seed_id>/<idea_id>/` |
 | `phase4` | Run Harbor oracle and nop checks. | `runs/oracle-nop-check/<task_id>/oracle-nop-status.json` |

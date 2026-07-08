@@ -54,7 +54,7 @@ PHASES: tuple[Phase, ...] = (
         key="phase1",
         aliases=("brainstorm", "seed-brainstorm"),
         title="Seed Brainstorm",
-        description="Read one seed and produce 3-5 substantially different task ideas with explicit difficulty profiles.",
+        description="Read one seed and produce configurable substantially different task ideas with explicit difficulty profiles.",
         inputs=(
             Artifact("seed", "seeds/{seed_id}/"),
             Artifact("prompt", "prompts/seed-brainstorm.md"),
@@ -196,6 +196,16 @@ IDEA_SCOPED_PHASES = {"phase3", "phase4", "phase5", "phase6", "phase7"}
 CLAUDE_RUN_PHASES = {"phase1", "phase2", "phase3", "phase5", "phase6"}
 
 
+def positive_int_arg(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be an integer >= 1") from exc
+    if parsed < 1:
+        raise argparse.ArgumentTypeError("must be an integer >= 1")
+    return parsed
+
+
 def get_phase(name: str) -> Phase:
     try:
         return PHASE_BY_NAME[name]
@@ -228,6 +238,7 @@ def build_phase_process_command(
     as_json: bool = False,
     model: str | None = None,
     effort: str | None = None,
+    idea_count: int | None = None,
 ) -> list[str]:
     phase_module = require_phase_module(phase)
     command = [sys.executable, "-m", phase_module, action, seed_id]
@@ -237,6 +248,12 @@ def build_phase_process_command(
         command.extend(["--idea-id", idea_id])
     elif idea_id:
         raise SystemExit(f"{phase.key} does not accept --idea-id")
+    if idea_count is not None:
+        if phase.key != "phase1":
+            raise SystemExit(f"{phase.key} does not accept --idea-count")
+        if action != "run":
+            raise SystemExit("--idea-count is only valid for phase1 run commands")
+        command.extend(["--idea-count", str(idea_count)])
 
     if dry_run:
         if action != "run":
@@ -313,6 +330,7 @@ def run_or_skip_phase(
     dry_run: bool = False,
     model: str | None = None,
     effort: str | None = None,
+    idea_count: int | None = None,
 ) -> PhaseRunResult:
     phase = get_phase(phase_name)
     label = f"{phase.key} {seed_id}" + (f" --idea-id {idea_id}" if idea_id else "")
@@ -328,6 +346,7 @@ def run_or_skip_phase(
         dry_run=dry_run,
         model=model,
         effort=effort,
+        idea_count=idea_count,
     )
     print(f"pipeline: running {label}")
     print(f"pipeline command: {command_display(command)}")
@@ -368,6 +387,13 @@ def load_pipeline_idea_ids(root: Path, seed_id: str) -> list[str]:
         if idea_id not in idea_ids:
             idea_ids.append(idea_id)
     return idea_ids
+
+
+def pipeline_phase1_count_matches(root: Path, seed_id: str, idea_count: int) -> bool:
+    try:
+        return len(load_pipeline_idea_ids(root, seed_id)) == idea_count
+    except SystemExit:
+        return False
 
 
 def review_decision_for(root: Path, seed_id: str, idea_id: str) -> str:
@@ -516,15 +542,25 @@ def command_pipeline(args: argparse.Namespace) -> int:
     root = project_root()
     if args.max_repairs < 0:
         raise SystemExit("--max-repairs must be >= 0")
+    phase1_count_mismatch = (
+        args.idea_count is not None
+        and not pipeline_phase1_count_matches(root, args.seed_id, args.idea_count)
+    )
+    if phase1_count_mismatch:
+        print(
+            f"pipeline: phase1 output does not have exactly {args.idea_count} idea(s); "
+            "phase1 will run"
+        )
 
     phase1 = run_or_skip_phase(
         root,
         "phase1",
         args.seed_id,
-        force=args.force,
+        force=args.force or phase1_count_mismatch,
         dry_run=args.dry_run,
         model=args.model,
         effort=args.effort,
+        idea_count=args.idea_count,
     )
     if phase1.exit_code != 0:
         return phase1.exit_code
@@ -544,6 +580,12 @@ def command_pipeline(args: argparse.Namespace) -> int:
     if args.idea_id:
         idea_ids = [args.idea_id]
     else:
+        if args.dry_run and phase1.ran:
+            print(
+                "pipeline: dry-run cannot infer idea ids because phase1 would run; "
+                "pass --idea-id or run phase1 first"
+            )
+            return 0
         if args.dry_run:
             try:
                 idea_ids = load_pipeline_idea_ids(root, args.seed_id)
@@ -625,6 +667,10 @@ def command_run(args: argparse.Namespace) -> int:
         command.extend(["--idea-id", args.idea_id])
     elif args.idea_id:
         raise SystemExit(f"{phase.key} does not accept --idea-id")
+    if args.idea_count is not None:
+        if phase.key != "phase1":
+            raise SystemExit(f"{phase.key} does not accept --idea-count")
+        command.extend(["--idea-count", str(args.idea_count)])
     if args.dry_run:
         command.append("--dry-run")
     if args.model:
@@ -716,6 +762,11 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("seed_id")
     run.add_argument("--idea-id", help="Idea id for idea-scoped phases such as phase3.")
     run.add_argument(
+        "--idea-count",
+        type=positive_int_arg,
+        help="Exact number of brainstorm ideas to request for phase1.",
+    )
+    run.add_argument(
         "--dry-run",
         action="store_true",
         help="Render the phase prompt and print the command without running Claude or validation.",
@@ -735,6 +786,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     pipeline.add_argument("seed_id")
     pipeline.add_argument("--idea-id", help="Run only one idea. Defaults to every idea from phase1 output.")
+    pipeline.add_argument(
+        "--idea-count",
+        type=positive_int_arg,
+        help="Exact number of brainstorm ideas to request from phase1 before downstream processing.",
+    )
     pipeline.add_argument(
         "--max-repairs",
         type=int,
