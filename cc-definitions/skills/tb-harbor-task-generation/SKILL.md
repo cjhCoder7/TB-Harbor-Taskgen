@@ -18,6 +18,7 @@ Use this skill for TB3 task creation and quality checks inside isolated workspac
 - Many seed tasks may be TB2 or older Harbor format. Use them only to infer abstract capabilities and boundaries; generated tasks must target TB3.
 - New tasks must differ from the seed in substance, not just names.
 - Do not copy seed instructions, fixtures, distinctive data, hidden answers, expected outputs, or verifier ground truth into generated tasks.
+- Do not put explanatory comments, docstrings, inline hints, bug descriptions, fix instructions, known-defect notes, TODO/FIXME markers, problem-specific test examples, sample corpora, self-checks, expected outputs, or target-behavior fixtures into the visible task environment.
 - Task difficulty should come from realistic terminal work: inspection, debugging, transformation, integration, reasoning, or multi-step execution.
 - Difficulty must be auditable in workspace artifacts. Brainstorm ideas should state an independent subskill floor, too-easy antipatterns, hardening levers, and fairness bounds; SkillNet summaries should preserve that difficulty floor rather than optimizing only for solvability.
 - Do not create difficulty through long prompts, arbitrary formatting traps, ambiguity, randomness, blocked networking, low timeouts, excessive resources, or hidden gotchas.
@@ -273,6 +274,8 @@ TB3 format checklist:
 - Synthetic author identity fields stay empty unless truthful values are provided; category and tags are non-empty.
 - `instruction.md` is concise, outcome-focused, absolute-path based, artifact-complete, avoids lengthy formal `##` sectioning and hard-wrapped prose, and ends with the exact TB3 suffix.
 - `environment/` contains only the starting state; `solution/` and `tests/` are never copied into the agent image.
+- Visible environment files and visible environment text must not contain explanatory comments, docstrings, inline hints, known-defect notes, TODO/FIXME markers, descriptions of what the bug is, instructions for how to fix it, or prose that helps the agent infer the intended fix.
+- The visible environment must not contain problem-specific test examples, sample corpora, self-checks, expected outputs, or other fixtures that demonstrate the task's target behavior or make the intended solution inferable.
 - `solution/solve.sh` solves from the visible starting state.
 - `tests/` is a separate verifier image that checks outcomes and writes reward without relying on command order, exact library choice, or oracle-only details.
 
@@ -317,12 +320,6 @@ If Harbor or Docker is unavailable, record the command and error under `output/l
 
 ## Quality Check
 
-Quality check priority:
-
-1. Treat difficulty calibration as a required gate. A task that is structurally valid and passes oracle/nop can still require modification when it is outside the intended difficulty band.
-2. Do not let TB3 formatting correctness hide a task that is too easy or too hard.
-3. Use `needs_modification` with `area: "difficulty"` for any difficulty issue that is fixable without replacing the task concept.
-
 Difficulty modification triggers:
 
 - The task reduces to a direct single-tool command, a short obvious loop, or a direct fixture lookup.
@@ -331,13 +328,12 @@ Difficulty modification triggers:
 - A programming or type-system task only tests shallow happy paths, can plausibly be hardcoded from visible examples, or relies on hidden fixture count rather than compositional requirements.
 - The task appears too hard despite oracle success, such as likely max-turn failure from excessive grammar/data scale or too many interacting edge cases.
 
+Environment leakage modification triggers:
+
+- Visible environment files or visible environment text contain explanatory comments, docstrings, inline hints, known-defect notes, TODO/FIXME markers, bug descriptions, fix instructions, or prose that helps the agent infer the intended fix.
+- The visible environment contains problem-specific test examples, sample corpora, self-checks, expected outputs, or fixtures that demonstrate the target behavior or make the intended solution inferable.
+
 ## Task Modification
-
-Modification priority:
-
-1. Address requested change items without weakening the intended task difficulty.
-2. When a change item has `area: "difficulty"`, modification may preserve the broad domain while making bounded concept adjustments.
-3. Do not make a difficult task easier just to simplify TB3 packaging, Docker setup, or verifier implementation.
 
 For difficulty hardening, prefer:
 

@@ -13,16 +13,6 @@ Review one generated Terminal-Bench/Harbor task and decide whether it is ready, 
 
 Write the review result to `output/review/`.
 
-Review priority:
-
-1. Difficulty calibration is a required gate, not an optional comment. Do not let TB3 formatting correctness hide a task that is too easy or too hard.
-2. Oracle/nop failure is review evidence, not an automatic rejection. If the task concept is fixable, use `needs_modification` and point to the failed reward, exit code, log, or task file that should be fixed.
-3. Use `needs_modification` with `area: "difficulty"` when a task is structurally valid but too easy for the intended benchmark.
-4. A task is too easy when the visible environment and instruction reduce the solve to a direct single-tool command, a short obvious loop, a direct fixture lookup, or a reference solution with fewer than three meaningful independent stages.
-5. Security, archive, credential, or forensics tasks are too easy when they use a tiny guaranteed-hit wordlist or fully pinned command parameters without requiring separate inference, triage, validation, normalization, or post-unlock processing.
-6. Programming or type-system tasks are too easy when they only test shallow happy paths, can plausibly be hardcoded from visible examples, or rely on hidden fixture count instead of compositional requirements.
-7. If a task appears too hard or likely to hit max turns despite oracle success, use `needs_modification` with `area: "difficulty"` and ask for a narrower grammar, smaller bounded data scale, clearer visible spec, or fewer interacting edge cases.
-
 Required work:
 
 1. Inspect the generated task files under `task/<seed_id>/<idea_id>/`.
@@ -62,6 +52,7 @@ Quality checklist:
 - Instruction quality: do not accept prose that is hard-wrapped at 80 or 90 columns inside a paragraph; request natural paragraphs where each paragraph is one physical line, separated by blank lines.
 - Environment and solution: agent image contains only the starting state, never copies `solution/` or `tests/`, is reproducible, and the reference solution solves from the same visible starting state with tools available in the agent image.
 - Environment comments: visible environment files and other visible environment text must not contain explanatory comments, docstrings, inline hints, known-defect notes, TODO/FIXME markers, descriptions of what the bug is, instructions for how to fix it, or prose that helps the agent infer the intended fix.
+- Visible tests: the visible environment must not contain problem-specific test examples, sample corpora, self-checks, expected outputs, or other fixtures that demonstrate the task's target behavior or make the intended solution inferable.
 - Verifier quality: separate verifier image, verifier-only files and dependencies stay in `tests/Dockerfile`, tests check externally visible outcomes and write reward, and reward hacking is resisted.
 - Dynamic evidence: if oracle/nop validation passed, oracle reward is exactly `1.0` and nop reward is exactly `0.0`; if it failed, the review must explain the failure and choose `needs_modification` when the issue is fixable.
 - Cleanliness: no generated/validation artifacts, caches, bytecode, transient logs, prompts, temporary workspace files, or leaked copied inputs remain in the task directory.

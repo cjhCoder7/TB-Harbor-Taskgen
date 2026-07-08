@@ -14,14 +14,6 @@ Repair one generated Terminal-Bench/Harbor task according to `review/<task_id>/r
 
 Write the complete repaired task to `output/task/`.
 
-Repair priority:
-
-1. Address the review's `modification_items` without weakening the intended task difficulty.
-2. If any item has `area: "difficulty"`, handle it before cosmetic or packaging cleanup unless the packaging issue blocks execution.
-3. If any item points to failed oracle/nop evidence, fix the task, solution, environment, or tests so the next oracle/nop check can produce oracle reward `1.0` and nop reward `0.0`.
-4. Preserve the broad domain, but allow bounded hardening or softening of fixtures, hidden cases, data scale, and task mechanics as directed by the review.
-5. Do not make a difficult task easier just to simplify TB3 packaging, Docker setup, or verifier implementation.
-
 Required work:
 
 1. Read `review/<task_id>/review.json` first.
