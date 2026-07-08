@@ -73,6 +73,8 @@ TB3 format checklist:
 - `instruction.md`: write prose as natural paragraphs. Do not hard-wrap a paragraph at 80 or 90 columns; each paragraph should stay on one physical line, with blank lines between paragraphs and bullets only when genuinely useful.
 - `instruction.md`: ends with exactly one blank line plus the required TB3 suffix, where `N` equals `[agent].timeout_sec`.
 - `environment/`: only the agent-visible starting state; never copies `solution/` or `tests/`.
+- `environment/`: visible files and visible text must not contain explanatory comments, docstrings, inline hints, known-defect notes, TODO/FIXME markers, descriptions of what the bug is, instructions for how to fix it, or prose that helps the agent infer the intended fix.
+- `environment/`: do not include problem-specific test examples, sample corpora, self-checks, expected outputs, or other fixtures that demonstrate the task's target behavior or make the intended solution inferable.
 - `solution/solve.sh`: real oracle solution from the same visible starting state; every external command exists in the agent image or is installed before use.
 - `tests/`: separate verifier image; verifier-only files and dependencies stay in `tests/Dockerfile`; `tests/test.sh` checks outcomes and writes reward. Tests must not depend on command order, exact library choice, oracle-only knowledge, or copied seed ground truth.
 
