@@ -159,7 +159,7 @@ flowchart LR
 ├── seeds/                 # read-only input seed tasks
 ├── src/taskgen/           # Python implementation
 ├── tests/                 # local unit tests
-├── model.json             # Claude model, binary, and per-phase effort config
+├── model.json             # Claude model, binary, timeout, and per-phase effort config
 └── pyproject.toml
 ```
 
@@ -168,12 +168,13 @@ set `PYTHONPATH=src`, and then delegate to the Python package.
 
 ## Configuration
 
-`model.json` controls the default Claude Code model, effort levels, and
-optionally the Claude Code binary:
+`model.json` controls the default Claude Code model, timeout, effort levels,
+and optionally the Claude Code binary:
 
 ```json
 {
   "claude_code_path": "cc-binary/claude-2.1.169-linux-x64",
+  "claude_code_timeout_sec": 1800,
   "default_model": "anthropic/claude-opus-4.8",
   "default_effort": "max",
   "phase_efforts": {
@@ -189,6 +190,12 @@ optionally the Claude Code binary:
 `claude_code_path` points to the local Claude Code executable under
 `cc-binary/`. Keep this relative path aligned with the binary available on the
 machine that runs the pipeline. The downloaded executable is not committed.
+
+`claude_code_timeout_sec` is the per-run Claude Code timeout in seconds. It
+must be positive; the default value `1800` limits each run to 30 minutes. When
+the limit is reached, the runner terminates that Claude Code process group and
+records exit code `124` with `timed_out: true` in the session status. Process
+group cleanup applies to the project's POSIX/Linux runtime.
 
 To download the Claude Code binary into a specific directory, change
 `CLAUDE_BIN_DIR` to the target location:

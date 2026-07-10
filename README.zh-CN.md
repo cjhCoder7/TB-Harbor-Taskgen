@@ -151,7 +151,7 @@ flowchart LR
 ├── seeds/                 # 只读输入 seed tasks
 ├── src/taskgen/           # Python 实现
 ├── tests/                 # 本地单元测试
-├── model.json             # Claude model、binary 和 per-phase effort config
+├── model.json             # Claude model、binary、timeout 和 per-phase effort config
 └── pyproject.toml
 ```
 
@@ -159,12 +159,12 @@ flowchart LR
 
 ## 配置
 
-`model.json` 控制默认 Claude Code model、effort levels，并可选地指定
-Claude Code binary：
+`model.json` 控制默认 Claude Code model、timeout、effort levels，并可选地指定 Claude Code binary：
 
 ```json
 {
   "claude_code_path": "cc-binary/claude-2.1.169-linux-x64",
+  "claude_code_timeout_sec": 1800,
   "default_model": "anthropic/claude-opus-4.8",
   "default_effort": "max",
   "phase_efforts": {
@@ -178,6 +178,8 @@ Claude Code binary：
 ```
 
 `claude_code_path` 指向 `cc-binary/` 下的本地 Claude Code 可执行文件。请保持这个相对路径与运行机器上的实际 binary 一致；下载的可执行文件不提交到仓库。
+
+`claude_code_timeout_sec` 是每次 Claude Code 运行的超时时间，单位为秒，且必须为正数。默认值 `1800` 表示 30 分钟；达到该时限后，runner 会在项目使用的 POSIX/Linux 运行环境中终止本次 Claude Code 的整个进程组，并在 session status 中记录退出码 `124` 和 `timed_out: true`。
 
 如果需要把 Claude Code binary 下载到指定目录，可以把 `CLAUDE_BIN_DIR` 改成目标目录：
 

@@ -61,11 +61,12 @@ phase4 之后使用的稳定 task id 是：
 
 ### `model.json`
 
-`model.json` 配置 Claude binary、默认模型、默认 effort 和按 phase 覆盖的 effort：
+`model.json` 配置 Claude binary、单次运行超时、默认模型、默认 effort 和按 phase 覆盖的 effort：
 
 ```json
 {
   "claude_code_path": "cc-binary/claude-2.1.169-linux-x64",
+  "claude_code_timeout_sec": 1800,
   "default_model": "anthropic/claude-opus-4.8",
   "default_effort": "max",
   "phase_efforts": {
@@ -81,6 +82,8 @@ phase4 之后使用的稳定 task id 是：
 支持的 effort 值是 `low`、`medium`、`high`、`xhigh`、`max`。
 
 `claude_code_path` 如果不是绝对路径，会从项目根目录解析。该 binary 是本地文件，并被 git 忽略。如果删除该字段，runner 会先使用唯一一个可执行的 `cc-binary/claude-*`，再回退到 `PATH` 上的 `claude`。
+
+`claude_code_timeout_sec` 设置每次 Claude Code 运行的超时时间，单位为秒，且必须为正数。默认值 `1800` 表示 30 分钟；运行达到该时限后，runner 会在 POSIX/Linux 环境终止其独立进程组，并记录退出码 `124` 和 `timed_out: true`。
 
 `phase_efforts` 支持 `src/taskgen/config.py` 中定义的 canonical phase key 和 alias。新增配置时优先使用 `phase1` 到 `phase7`。
 
@@ -197,9 +200,9 @@ session metadata：
 | `prompt.md` | 本次运行使用的 prompt 副本。 |
 | `claude-code.txt` | Claude stream-json 输出和 stderr。 |
 | `cost.json` | 解析后的 cost 和 token 摘要。 |
-| `status.json` | 运行状态、workspace 路径、同步输出和 cost 摘要。 |
+| `status.json` | 运行状态、超时元数据、workspace 路径、同步输出和 cost 摘要。 |
 
-Claude 运行参数包括 `--verbose`、`--output-format=stream-json`、`--permission-mode bypassPermissions`、`--print`。`CLAUDE_CONFIG_DIR` 绑定到本次 run 目录，环境里设置 `IS_SANDBOX=1`。
+Claude 运行参数包括 `--verbose`、`--output-format=stream-json`、`--permission-mode bypassPermissions`、`--print`。`CLAUDE_CONFIG_DIR` 绑定到本次 run 目录，环境里设置 `IS_SANDBOX=1`。在 POSIX/Linux 环境中，runner 会把 Claude 放入独立进程组，因此配置超时时也会终止其启动的工具子进程。
 
 ## 8. Phase 契约
 

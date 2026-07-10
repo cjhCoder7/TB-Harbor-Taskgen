@@ -67,12 +67,13 @@ task directories, and manifest events.
 
 ### `model.json`
 
-`model.json` configures the Claude binary, default model, default effort, and
-per-phase effort levels:
+`model.json` configures the Claude binary, per-run timeout, default model,
+default effort, and per-phase effort levels:
 
 ```json
 {
   "claude_code_path": "cc-binary/claude-2.1.169-linux-x64",
+  "claude_code_timeout_sec": 1800,
   "default_model": "anthropic/claude-opus-4.8",
   "default_effort": "max",
   "phase_efforts": {
@@ -91,6 +92,12 @@ Supported efforts are `low`, `medium`, `high`, `xhigh`, and `max`.
 absolute. The referenced binary is local and is ignored by git. If this field is
 removed, the runner uses exactly one executable `cc-binary/claude-*`, then
 falls back to `claude` on `PATH`.
+
+`claude_code_timeout_sec` sets the timeout for each Claude Code run in seconds
+and must be positive. The default value `1800` is 30 minutes. When a run reaches
+this limit, the runner terminates its isolated process group and records exit
+code `124` with `timed_out: true`. Process-group cleanup is a POSIX/Linux
+runtime behavior.
 
 `phase_efforts` accepts canonical phase keys and aliases defined in
 `src/taskgen/config.py`. Prefer canonical keys (`phase1` through `phase7`) for
@@ -227,11 +234,13 @@ Session metadata includes:
 | `prompt.md` | Prompt copy used for the run. |
 | `claude-code.txt` | Claude stream-json output and stderr. |
 | `cost.json` | Parsed cost and token summary. |
-| `status.json` | Run status, workspace paths, synced outputs, and cost summary. |
+| `status.json` | Run status, timeout metadata, workspace paths, synced outputs, and cost summary. |
 
 Claude runs with `--verbose`, `--output-format=stream-json`,
 `--permission-mode bypassPermissions`, `--print`, `CLAUDE_CONFIG_DIR` scoped to
-the run directory, and `IS_SANDBOX=1`.
+the run directory, and `IS_SANDBOX=1`. On POSIX/Linux, the runner starts Claude
+in an isolated process group so a configured timeout also stops its tool
+subprocesses.
 
 ## 8. Phase Contracts
 

@@ -5,11 +5,13 @@ from __future__ import annotations
 
 import argparse
 import os
+import signal
 import shutil
 import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import BinaryIO
 
 from taskgen.claude.cost import format_cost_summary
 from taskgen.claude.workspace import prepare_workspace, sync_workspace_outputs, write_status
@@ -17,6 +19,7 @@ from taskgen.common import project_root
 from taskgen.config import (
     EFFORT_LEVELS,
     resolve_claude_code_path,
+    resolve_claude_code_timeout_sec,
     resolve_effort_level,
     resolve_model_name,
 )
@@ -33,6 +36,7 @@ DISALLOWED_TOOL_ARGS = (
     "Bash(*rg --files / *)",
     "Bash(*locate *)",
 )
+TIMEOUT_EXIT_CODE = 124
 
 
 def executable_candidates(root: Path) -> list[Path]:
@@ -89,6 +93,42 @@ def run_id() -> str:
     return f"{timestamp}-{os.getpid()}"
 
 
+def terminate_process_tree(process: subprocess.Popen[bytes]) -> None:
+    """Force-stop the isolated process group created for one Claude run."""
+    if os.name == "posix":
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    else:
+        process.kill()
+    process.wait()
+
+
+def run_claude_process(
+    command: list[str],
+    *,
+    cwd: Path,
+    env: dict[str, str],
+    log_handle: BinaryIO,
+    timeout_sec: float,
+) -> tuple[int, bool]:
+    process = subprocess.Popen(
+        command,
+        cwd=cwd,
+        env=env,
+        stdin=subprocess.DEVNULL,
+        stdout=log_handle,
+        stderr=subprocess.STDOUT,
+        start_new_session=True,
+    )
+    try:
+        return process.wait(timeout=timeout_sec), False
+    except subprocess.TimeoutExpired:
+        terminate_process_tree(process)
+        return TIMEOUT_EXIT_CODE, True
+
+
 def run_claude_logged(args: argparse.Namespace) -> int:
     root = project_root()
     resolved_run_id = run_id()
@@ -112,6 +152,7 @@ def run_claude_logged(args: argparse.Namespace) -> int:
     prompt = prompt_copy.read_text(encoding="utf-8")
     model = resolve_model_name(root, args.model)
     effort = resolve_effort_level(root, args.effort, args.phase)
+    timeout_sec = resolve_claude_code_timeout_sec(root)
     command = build_claude_command(root, model, effort, prompt)
 
     env = os.environ.copy()
@@ -122,17 +163,19 @@ def run_claude_logged(args: argparse.Namespace) -> int:
     )
     env["IS_SANDBOX"] = "1"
 
+    timed_out = False
     with stream_log.open("wb") as log_handle:
-        result = subprocess.run(
+        exit_code, timed_out = run_claude_process(
             command,
             cwd=workspace_dir,
             env=env,
-            stdin=subprocess.DEVNULL,
-            stdout=log_handle,
-            stderr=subprocess.STDOUT,
-            check=False,
+            log_handle=log_handle,
+            timeout_sec=timeout_sec,
         )
-    exit_code = result.returncode
+        if timed_out:
+            log_handle.write(
+                f"\nClaude Code timed out after {timeout_sec:g} seconds.\n".encode("utf-8")
+            )
 
     if exit_code == 0:
         synced_outputs = sync_workspace_outputs(root, workspace_dir, args.phase, args.subject)
@@ -153,6 +196,8 @@ def run_claude_logged(args: argparse.Namespace) -> int:
         claude_config_dir=claude_config_dir,
         synced_outputs=synced_outputs,
         exit_code=exit_code,
+        timed_out=timed_out,
+        timeout_sec=timeout_sec,
     )
 
     cost = status.get("cost")
@@ -160,6 +205,8 @@ def run_claude_logged(args: argparse.Namespace) -> int:
     print(f"claude session dir: {run_dir}", file=sys.stderr)
     print(f"claude stream log: {stream_log}", file=sys.stderr)
     print(f"claude workspace: {workspace_dir}", file=sys.stderr)
+    if timed_out:
+        print(f"claude timeout: exceeded {timeout_sec:g} seconds", file=sys.stderr)
     print(f"claude summary: {cost_summary}", file=sys.stderr)
     print(f"claude cost file: {cost_path}", file=sys.stderr)
     return exit_code

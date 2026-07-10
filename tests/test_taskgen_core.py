@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import json
 import os
+import signal
+import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, call, patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -19,7 +22,7 @@ from taskgen.claude.cost import OpenRouterQueryError
 from taskgen.claude.cost import parse_claude_stream_log
 from taskgen.claude.cost import format_cost_summary
 from taskgen.claude.cost import summarize_claude_stream_log
-from taskgen.claude.runner import build_claude_command
+from taskgen.claude.runner import build_claude_command, run_claude_logged
 from taskgen.claude.workspace import (
     phase_input_paths,
     phase_output_paths,
@@ -65,6 +68,79 @@ def write_fake_claude_session(project: Path, phase: str, subject: str, run_id: s
     return session.relative_to(project).as_posix()
 
 
+def fake_claude_runner_fixture(
+    root: Path,
+    timeout_sec: int | float = 75,
+) -> tuple[dict[str, Path], SimpleNamespace]:
+    workspace_dir = root / "workspace"
+    workspace_dir.mkdir()
+    run_dir = root / "run"
+    run_dir.mkdir()
+    prompt_copy = run_dir / "prompt.md"
+    prompt_copy.write_text("prompt", encoding="utf-8")
+    claude_config_dir = run_dir / "claude-config"
+    claude_config_dir.mkdir()
+    (root / "model.json").write_text(
+        json.dumps({"claude_code_timeout_sec": timeout_sec}),
+        encoding="utf-8",
+    )
+    workspace_payload = {
+        "run_dir": run_dir,
+        "workspace_dir": workspace_dir,
+        "claude_config_dir": claude_config_dir,
+        "stream_log": run_dir / "claude-code.jsonl",
+        "cost_path": run_dir / "cost.json",
+        "status_path": run_dir / "status.json",
+        "prompt_copy": prompt_copy,
+        "workspace_prompt": workspace_dir / "prompt.md",
+    }
+    args = SimpleNamespace(
+        phase="seed-brainstorm",
+        subject="seed-a",
+        prompt_file=root / "input-prompt.md",
+        model=None,
+        effort=None,
+    )
+    return workspace_payload, args
+
+
+def process_is_running(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+    proc_stat = Path(f"/proc/{pid}/stat")
+    if proc_stat.exists():
+        try:
+            state = proc_stat.read_text(encoding="utf-8").split()[2]
+        except (FileNotFoundError, IndexError, OSError):
+            return False
+        if state in {"Z", "X"}:
+            return False
+    return True
+
+
+def wait_for_process_exit(pid: int, timeout_sec: float = 1.0) -> bool:
+    deadline = time.monotonic() + timeout_sec
+    while time.monotonic() < deadline:
+        if not process_is_running(pid):
+            return True
+        time.sleep(0.01)
+    return not process_is_running(pid)
+
+
+def force_kill_processes(pid_paths: tuple[Path, ...]) -> None:
+    for pid_path in pid_paths:
+        try:
+            pid = int(pid_path.read_text(encoding="utf-8"))
+            os.kill(pid, signal.SIGKILL)
+        except (FileNotFoundError, ProcessLookupError, ValueError):
+            pass
+
+
 def difficulty_profile_fixture() -> dict[str, object]:
     return {
         "minimum_independent_subskills": 3,
@@ -84,6 +160,12 @@ def difficulty_hardening_fixture() -> dict[str, object]:
 
 
 class ModelConfigTests(unittest.TestCase):
+    def test_claude_code_timeout_defaults_to_half_hour(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = load_model_config(Path(tmp))
+
+        self.assertEqual(config.claude_code_timeout_sec, 1800.0)
+
     def test_load_model_json_and_resolve_relative_claude_path(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -91,6 +173,7 @@ class ModelConfigTests(unittest.TestCase):
                 json.dumps(
                     {
                         "claude_code_path": "cc-binary/claude-test",
+                        "claude_code_timeout_sec": 75.5,
                         "default_model": "test/model",
                         "default_effort": "high",
                         "phase_efforts": {"phase1": "max", "task-review": "medium"},
@@ -103,6 +186,7 @@ class ModelConfigTests(unittest.TestCase):
 
             self.assertEqual(config.default_model, "test/model")
             self.assertEqual(config.default_effort, "high")
+            self.assertEqual(config.claude_code_timeout_sec, 75.5)
             self.assertEqual(config.phase_efforts["phase1"], "max")
             self.assertEqual(config.phase_efforts["task-review"], "medium")
             self.assertEqual(resolve_claude_code_path(root), root / "cc-binary/claude-test")
@@ -122,6 +206,18 @@ class ModelConfigTests(unittest.TestCase):
 
             with self.assertRaises(SystemExit):
                 load_model_config(root)
+
+    def test_invalid_claude_code_timeout_fails_fast(self) -> None:
+        for invalid_timeout in (0, -1, True, "1800", float("nan"), float("inf"), float("-inf")):
+            with self.subTest(invalid_timeout=invalid_timeout), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                (root / "model.json").write_text(
+                    json.dumps({"claude_code_timeout_sec": invalid_timeout}),
+                    encoding="utf-8",
+                )
+
+                with self.assertRaises(SystemExit):
+                    load_model_config(root)
 
     def test_invalid_phase_effort_fails_fast(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -167,6 +263,147 @@ class ClaudeRunnerTests(unittest.TestCase):
         self.assertIn("Bash(*rg --files / *)", command)
         self.assertIn("Bash(*locate *)", command)
         self.assertLess(command.index("--disallowedTools"), command.index("--print"))
+
+    def test_run_claude_passes_configured_timeout_to_subprocess(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace_payload, args = fake_claude_runner_fixture(root)
+            process = MagicMock()
+            process.wait.return_value = 1
+
+            with (
+                patch("taskgen.claude.runner.project_root", return_value=root),
+                patch("taskgen.claude.runner.run_id", return_value="run-1"),
+                patch("taskgen.claude.runner.prepare_workspace", return_value=workspace_payload),
+                patch("taskgen.claude.runner.build_claude_command", return_value=["claude"]),
+                patch("taskgen.claude.runner.subprocess.Popen", return_value=process) as popen,
+                patch("taskgen.claude.runner.write_status", return_value={}) as write_status,
+            ):
+                exit_code = run_claude_logged(args)
+
+        self.assertEqual(exit_code, 1)
+        self.assertIs(popen.call_args.kwargs["start_new_session"], True)
+        process.wait.assert_called_once_with(timeout=75.0)
+        self.assertIs(write_status.call_args.kwargs["timed_out"], False)
+        self.assertEqual(write_status.call_args.kwargs["timeout_sec"], 75.0)
+
+    def test_run_claude_records_timeout_without_syncing_outputs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace_payload, args = fake_claude_runner_fixture(root)
+            process = MagicMock()
+            process.pid = 999_999
+            process.wait.side_effect = [
+                subprocess.TimeoutExpired(cmd=["claude"], timeout=75),
+                -signal.SIGKILL,
+            ]
+
+            with (
+                patch("taskgen.claude.runner.project_root", return_value=root),
+                patch("taskgen.claude.runner.run_id", return_value="run-1"),
+                patch("taskgen.claude.runner.prepare_workspace", return_value=workspace_payload),
+                patch("taskgen.claude.runner.build_claude_command", return_value=["claude"]),
+                patch("taskgen.claude.runner.subprocess.Popen", return_value=process),
+                patch("taskgen.claude.runner.os.killpg") as killpg,
+                patch("taskgen.claude.runner.sync_workspace_outputs") as sync_outputs,
+                patch("taskgen.claude.runner.write_status", return_value={}) as write_status,
+            ):
+                exit_code = run_claude_logged(args)
+
+        self.assertEqual(exit_code, 124)
+        sync_outputs.assert_not_called()
+        write_status.assert_called_once()
+        self.assertEqual(write_status.call_args.kwargs["exit_code"], 124)
+        self.assertEqual(write_status.call_args.kwargs["synced_outputs"], [])
+        self.assertIs(write_status.call_args.kwargs["timed_out"], True)
+        self.assertEqual(write_status.call_args.kwargs["timeout_sec"], 75.0)
+        self.assertEqual(
+            process.wait.call_args_list,
+            [call(timeout=75.0), call()],
+        )
+        killpg.assert_called_once_with(process.pid, signal.SIGKILL)
+
+    @unittest.skipUnless(os.name == "posix", "process-group cleanup requires POSIX")
+    def test_timeout_cleans_up_real_process_tree(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace_payload, args = fake_claude_runner_fixture(root, timeout_sec=0.5)
+            parent_pid_path = root / "parent.pid"
+            child_pid_path = root / "child.pid"
+            parent_marker = root / "parent.marker"
+            child_marker = root / "child.marker"
+            child_script = root / "child.py"
+            child_script.write_text(
+                "import os\n"
+                "import sys\n"
+                "import time\n"
+                "from pathlib import Path\n"
+                "Path(sys.argv[1]).write_text(str(os.getpid()), encoding='utf-8')\n"
+                "while True:\n"
+                "    with Path(sys.argv[2]).open('a', encoding='utf-8') as marker:\n"
+                "        marker.write('child\\n')\n"
+                "    time.sleep(0.02)\n",
+                encoding="utf-8",
+            )
+            parent_script = root / "parent.py"
+            parent_script.write_text(
+                "import os\n"
+                "import subprocess\n"
+                "import sys\n"
+                "import time\n"
+                "from pathlib import Path\n"
+                "subprocess.Popen([sys.executable, sys.argv[1], sys.argv[4], sys.argv[5]])\n"
+                "Path(sys.argv[2]).write_text(str(os.getpid()), encoding='utf-8')\n"
+                "while True:\n"
+                "    with Path(sys.argv[3]).open('a', encoding='utf-8') as marker:\n"
+                "        marker.write('parent\\n')\n"
+                "    time.sleep(0.02)\n",
+                encoding="utf-8",
+            )
+            command = [
+                sys.executable,
+                str(parent_script),
+                str(child_script),
+                str(parent_pid_path),
+                str(parent_marker),
+                str(child_pid_path),
+                str(child_marker),
+            ]
+            pid_paths = (parent_pid_path, child_pid_path)
+
+            try:
+                with (
+                    patch("taskgen.claude.runner.project_root", return_value=root),
+                    patch("taskgen.claude.runner.run_id", return_value="run-1"),
+                    patch("taskgen.claude.runner.prepare_workspace", return_value=workspace_payload),
+                    patch("taskgen.claude.runner.build_claude_command", return_value=command),
+                    patch("taskgen.claude.runner.sync_workspace_outputs") as sync_outputs,
+                    patch("taskgen.claude.runner.write_status", return_value={}) as write_status,
+                ):
+                    exit_code = run_claude_logged(args)
+
+                self.assertEqual(exit_code, 124)
+                sync_outputs.assert_not_called()
+                self.assertEqual(write_status.call_args.kwargs["exit_code"], 124)
+                self.assertIs(write_status.call_args.kwargs["timed_out"], True)
+                self.assertEqual(write_status.call_args.kwargs["timeout_sec"], 0.5)
+                for path in (*pid_paths, parent_marker, child_marker):
+                    self.assertTrue(path.exists(), f"process fixture did not create {path.name}")
+
+                pids = [int(path.read_text(encoding="utf-8")) for path in pid_paths]
+                for pid in pids:
+                    self.assertTrue(wait_for_process_exit(pid), f"process {pid} survived timeout cleanup")
+
+                marker_sizes = {path: path.stat().st_size for path in (parent_marker, child_marker)}
+                self.assertTrue(all(size > 0 for size in marker_sizes.values()))
+                time.sleep(0.2)
+                self.assertEqual(
+                    {path: path.stat().st_size for path in marker_sizes},
+                    marker_sizes,
+                    "a timed-out process continued writing after run_claude_logged returned",
+                )
+            finally:
+                force_kill_processes(pid_paths)
 
 
 class PipelineTests(unittest.TestCase):

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -11,6 +12,7 @@ from typing import Any
 
 EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
 MODEL_CONFIG_FILENAME = "model.json"
+DEFAULT_CLAUDE_CODE_TIMEOUT_SEC = 1800.0
 PHASE_EFFORT_ALIASES = {
     "phase1": ("phase1", "brainstorm", "seed-brainstorm"),
     "phase2": ("phase2", "skillnet", "skillnet-research"),
@@ -33,6 +35,7 @@ class ModelConfig:
     default_effort: str | None = None
     phase_efforts: dict[str, str] = field(default_factory=dict)
     claude_code_path: str | None = None
+    claude_code_timeout_sec: float = DEFAULT_CLAUDE_CODE_TIMEOUT_SEC
 
 
 def load_model_config(root: Path) -> ModelConfig:
@@ -52,6 +55,12 @@ def load_model_config(root: Path) -> ModelConfig:
     default_effort = read_optional_non_empty_string(payload, "default_effort", MODEL_CONFIG_FILENAME)
     phase_efforts = read_phase_efforts(payload)
     claude_code_path = read_optional_non_empty_string(payload, "claude_code_path", MODEL_CONFIG_FILENAME)
+    claude_code_timeout_sec = read_positive_number(
+        payload,
+        "claude_code_timeout_sec",
+        MODEL_CONFIG_FILENAME,
+        default=DEFAULT_CLAUDE_CODE_TIMEOUT_SEC,
+    )
     if default_effort is not None and default_effort not in EFFORT_LEVELS:
         allowed = ", ".join(EFFORT_LEVELS)
         raise SystemExit(f"{MODEL_CONFIG_FILENAME}.default_effort must be one of: {allowed}")
@@ -61,6 +70,7 @@ def load_model_config(root: Path) -> ModelConfig:
         default_effort=default_effort,
         phase_efforts=phase_efforts,
         claude_code_path=claude_code_path,
+        claude_code_timeout_sec=claude_code_timeout_sec,
     )
 
 
@@ -71,6 +81,25 @@ def read_optional_non_empty_string(payload: dict[str, Any], key: str, source: st
     if not isinstance(value, str) or not value.strip():
         raise SystemExit(f"{source}.{key} must be a non-empty string when set")
     return value.strip()
+
+
+def read_positive_number(
+    payload: dict[str, Any],
+    key: str,
+    source: str,
+    *,
+    default: float,
+) -> float:
+    value = payload.get(key, default)
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        raise SystemExit(f"{source}.{key} must be a positive finite number")
+    try:
+        numeric_value = float(value)
+    except OverflowError:
+        raise SystemExit(f"{source}.{key} must be a positive finite number") from None
+    if not math.isfinite(numeric_value) or numeric_value <= 0:
+        raise SystemExit(f"{source}.{key} must be a positive finite number")
+    return numeric_value
 
 
 def read_phase_efforts(payload: dict[str, Any]) -> dict[str, str]:
@@ -151,3 +180,7 @@ def resolve_claude_code_path(root: Path) -> Path | None:
     if path.is_absolute():
         return path
     return root / path
+
+
+def resolve_claude_code_timeout_sec(root: Path) -> float:
+    return load_model_config(root).claude_code_timeout_sec

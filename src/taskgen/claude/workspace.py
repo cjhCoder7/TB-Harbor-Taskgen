@@ -327,6 +327,8 @@ def write_status(
     claude_config_dir: Path,
     synced_outputs: list[str],
     exit_code: int,
+    timed_out: bool = False,
+    timeout_sec: float | None = None,
 ) -> dict[str, object]:
     cost_summary = summarize_claude_stream_log(stream_log)
     write_cost_summary(cost_summary, cost_path)
@@ -338,6 +340,8 @@ def write_status(
         "project_root": str(project_root),
         "workspace_dir": str(workspace_dir),
         "exit_code": exit_code,
+        "timed_out": timed_out,
+        "timeout_sec": timeout_sec,
         "prompt": str(prompt_copy),
         "workspace_prompt": str(workspace_prompt),
         "stream_log": str(stream_log),
@@ -395,6 +399,8 @@ def command_status(args: argparse.Namespace) -> int:
         claude_config_dir=args.claude_config_dir,
         synced_outputs=json.loads(args.synced_outputs_json),
         exit_code=args.exit_code,
+        timed_out=args.timed_out,
+        timeout_sec=args.timeout_sec,
     )
     return 0
 
@@ -432,6 +438,8 @@ def build_parser() -> argparse.ArgumentParser:
     status.add_argument("--claude-config-dir", type=Path, required=True)
     status.add_argument("--synced-outputs-json", required=True)
     status.add_argument("--exit-code", type=int, required=True)
+    status.add_argument("--timed-out", action="store_true")
+    status.add_argument("--timeout-sec", type=float)
     status.set_defaults(func=command_status)
 
     return parser
