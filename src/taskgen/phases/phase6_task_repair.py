@@ -12,10 +12,17 @@ from typing import Any
 
 from taskgen.common import (
     ValidationReport,
+    append_jsonl_object,
+    delegated_phase_subject_lock_kwargs,
     load_json,
+    phase_subject_lock,
     print_report,
     project_root,
+    read_jsonl_objects,
+    require_no_template_markers,
     require_object,
+    select_new_claude_session,
+    validate_claude_session_reference,
 )
 from taskgen.config import EFFORT_LEVELS, resolve_effort_level, resolve_model_name
 from taskgen.phases.phase3_task_generation import (
@@ -56,11 +63,15 @@ def list_session_dirs(root: Path, seed_id: str, idea_id: str) -> set[Path]:
 
 
 def find_new_session_dir(root: Path, seed_id: str, idea_id: str, before: set[Path]) -> Path | None:
-    created = list(list_session_dirs(root, seed_id, idea_id) - before)
-    if not created:
-        return None
-    created.sort(key=lambda path: path.stat().st_mtime_ns, reverse=True)
-    return created[0]
+    subject = subject_for(seed_id, idea_id)
+    session_dir, _ = select_new_claude_session(
+        root,
+        expected_phase=PHASE_NAME,
+        expected_subject=subject,
+        expected_outputs=[generated_task_ref_for(seed_id, idea_id)],
+        before=before,
+    )
+    return session_dir
 
 
 def review_ref(seed_id: str, idea_id: str) -> str:
@@ -86,9 +97,7 @@ def append_manifest_event(root: Path, seed_id: str, idea_id: str, claude_session
         "reason": "phase 6 task repair completed",
     }
     manifest_path = root / "runs/task-manifest.jsonl"
-    manifest_path.parent.mkdir(parents=True, exist_ok=True)
-    with manifest_path.open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n")
+    append_jsonl_object(manifest_path, payload)
 
 
 def ensure_phase6_inputs(root: Path, seed_id: str, idea_id: str) -> list[str]:
@@ -125,7 +134,7 @@ def load_review_decision(root: Path, seed_id: str, idea_id: str, errors: list[st
     review_path = review_json_path_for(root, seed_id, idea_id)
     try:
         payload = json.loads(review_path.read_text(encoding="utf-8"))
-    except OSError as exc:
+    except (OSError, UnicodeError) as exc:
         errors.append(f"cannot read review json: {review_path}: {exc}")
         return None
     except json.JSONDecodeError as exc:
@@ -154,6 +163,10 @@ def render_phase6_prompt(root: Path, seed_id: str, idea_id: str) -> Path:
     }
     for marker, value in replacements.items():
         prompt = prompt.replace(marker, value)
+    unreplaced = [marker for marker in replacements if marker in prompt]
+    if unreplaced:
+        raise SystemExit(f"phase6 prompt contains unreplaced marker(s): {', '.join(unreplaced)}")
+    require_no_template_markers(prompt, "phase6 prompt")
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(prompt, encoding="utf-8")
     return output_path
@@ -215,16 +228,7 @@ def validate_manifest_event(root: Path, seed_id: str, idea_id: str, report: Vali
     task_id = subject_for(seed_id, idea_id)
     found = False
     candidate_errors: list[str] = []
-    for line_number, line in enumerate(manifest_path.read_text(encoding="utf-8").splitlines(), start=1):
-        if not line.strip():
-            continue
-        try:
-            event = json.loads(line)
-        except json.JSONDecodeError as exc:
-            report.errors.append(f"invalid JSONL at {manifest_path}:{line_number}: {exc}")
-            continue
-        if not isinstance(event, dict):
-            continue
+    for line_number, event in read_jsonl_objects(manifest_path, report):
         if not (
             event.get("event") == "repaired"
             and event.get("seed_id") == seed_id
@@ -255,17 +259,17 @@ def validate_manifest_candidate(root: Path, event: dict[str, Any], report: Valid
     if not isinstance(event.get("reason"), str) or not event["reason"].strip():
         errors.append("reason must be a non-empty string")
 
-    claude_session_ref = event.get("claude_session_ref")
-    if not isinstance(claude_session_ref, str) or not claude_session_ref.strip():
-        errors.append("claude_session_ref must be a non-empty string")
-        return errors
-
-    session_path = root / claude_session_ref
-    report.checked_paths.append(str(session_path))
-    if not session_path.is_dir():
-        errors.append(f"claude_session_ref does not point to a directory: {claude_session_ref}")
-    elif not (session_path / "status.json").is_file():
-        errors.append(f"claude_session_ref is missing status.json: {claude_session_ref}")
+    subject = str(event.get("task_id"))
+    errors.extend(
+        validate_claude_session_reference(
+            root,
+            event.get("claude_session_ref"),
+            expected_phase=PHASE_NAME,
+            expected_subject=subject,
+            expected_outputs=[str(event.get("task_path"))],
+            report=report,
+        )
+    )
     return errors
 
 
@@ -273,21 +277,23 @@ def validate_new_session_synced_task(session_dir: Path, expected_output: str) ->
     status_path = session_dir / "status.json"
     try:
         status = json.loads(status_path.read_text(encoding="utf-8"))
-    except OSError as exc:
+    except (OSError, UnicodeError) as exc:
         return [f"cannot read Claude session status: {status_path}: {exc}"]
     except json.JSONDecodeError as exc:
         return [f"invalid JSON in Claude session status: {status_path}: {exc}"]
 
+    if not isinstance(status, dict):
+        return [f"Claude session status must contain an object: {status_path}"]
     synced = status.get("synced_outputs")
-    if not isinstance(synced, list) or expected_output not in synced:
+    if synced != [expected_output]:
         return [
             "Claude repair run did not sync repaired task output; "
-            f"expected {expected_output!r} in status.synced_outputs"
+            f"expected exactly [{expected_output!r}] in status.synced_outputs"
         ]
     return []
 
 
-def command_run(args: argparse.Namespace) -> int:
+def _command_run_locked(args: argparse.Namespace) -> int:
     root = project_root()
     errors = ensure_phase6_inputs(root, args.seed_id, args.idea_id)
     if errors:
@@ -309,20 +315,28 @@ def command_run(args: argparse.Namespace) -> int:
     if args.dry_run:
         return 0
 
+    subject = subject_for(args.seed_id, args.idea_id)
+    expected_output = generated_task_ref_for(args.seed_id, args.idea_id)
     before_sessions = list_session_dirs(root, args.seed_id, args.idea_id)
-    exit_code = subprocess.run(command, cwd=root, check=False).returncode
+    exit_code = subprocess.run(
+        command,
+        cwd=root,
+        check=False,
+        **delegated_phase_subject_lock_kwargs(root, subject),
+    ).returncode
     if exit_code != 0:
         return exit_code
 
-    session_dir = find_new_session_dir(root, args.seed_id, args.idea_id, before_sessions)
+    session_dir, session_errors = select_new_claude_session(
+        root,
+        expected_phase=PHASE_NAME,
+        expected_subject=subject,
+        expected_outputs=[expected_output],
+        before=before_sessions,
+    )
     if session_dir is None:
-        print("cannot validate repair run: no new Claude phase6 session directory was found", file=sys.stderr)
-        return 1
-
-    expected_output = generated_task_ref_for(args.seed_id, args.idea_id)
-    sync_errors = validate_new_session_synced_task(session_dir, expected_output)
-    if sync_errors:
-        for error in sync_errors:
+        print("cannot validate repair run: Claude session validation failed", file=sys.stderr)
+        for error in session_errors:
             print(f"- {error}", file=sys.stderr)
         return 1
 
@@ -338,6 +352,13 @@ def command_run(args: argparse.Namespace) -> int:
     print()
     print("validating phase6 manifest...")
     return print_report(validate_phase6(root, args.seed_id, args.idea_id), as_json=False)
+
+
+def command_run(args: argparse.Namespace) -> int:
+    root = project_root()
+    subject = subject_for(args.seed_id, args.idea_id)
+    with phase_subject_lock(root, PHASE_NAME, subject):
+        return _command_run_locked(args)
 
 
 def command_validate(args: argparse.Namespace) -> int:

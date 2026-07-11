@@ -8,4 +8,4 @@ if [[ -f "${script_dir}/env_init.sh" ]]; then
 fi
 
 uv tool install harbor==0.13.2
-uv tool install skillnet-ai
+uv tool install skillnet-ai==0.0.18

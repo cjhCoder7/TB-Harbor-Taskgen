@@ -1,6 +1,7 @@
 {
   "claude_code_path": "cc-binary/claude-2.1.169-linux-x64",
   "claude_code_timeout_sec": 1800,
+  "harbor_check_timeout_sec": 10800,
   "default_model": "claude-opus-4-8",
   "default_effort": "max",
   "phase_efforts": {

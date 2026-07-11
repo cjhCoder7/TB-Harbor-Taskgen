@@ -63,6 +63,9 @@ The stable task id throughout the workflow is:
 <seed_id>__<idea_id>
 ```
 
+IDs use `[A-Za-z0-9._-]+`, cannot contain the reserved `__` separator, and are
+limited to 128 characters for seeds and 120 for ideas.
+
 The repository does not include seed data. Add seed tasks under
 `seeds/<seed_id>/` before running the pipeline, and decide separately whether
 those inputs should be committed.
@@ -175,7 +178,8 @@ and optionally the Claude Code binary:
 {
   "claude_code_path": "cc-binary/claude-2.1.169-linux-x64",
   "claude_code_timeout_sec": 1800,
-  "default_model": "anthropic/claude-opus-4.8",
+  "harbor_check_timeout_sec": 10800,
+  "default_model": "claude-opus-4-8",
   "default_effort": "max",
   "phase_efforts": {
     "phase1": "max",
@@ -196,6 +200,11 @@ must be positive; the default value `1800` limits each run to 30 minutes. When
 the limit is reached, the runner terminates that Claude Code process group and
 records exit code `124` with `timed_out: true` in the session status. Process
 group cleanup applies to the project's POSIX/Linux runtime.
+
+`harbor_check_timeout_sec` is the supervisor timeout for each Harbor oracle or
+nop check. The default `10800` seconds leaves headroom above the generated
+task's normal two-hour agent limit while preventing a stuck Harbor or Docker
+process from waiting forever.
 
 To download the Claude Code binary into a specific directory, change
 `CLAUDE_BIN_DIR` to the target location:
@@ -250,6 +259,12 @@ Clean intermediate run artifacts with:
 ```bash
 scripts/clean-intermediate.sh --apply
 ```
+
+Cleanup preserves the append-only `runs/task-manifest.jsonl` by default and
+refuses to run while a pipeline session is active. Use `--drop-manifest` only
+when audit history should also be removed; `--force-active` bypasses the active
+run guard and should be reserved for recovery. Pending crash-recovery journals
+also block cleanup; `--discard-transactions` is the explicit destructive override.
 
 ## Development
 

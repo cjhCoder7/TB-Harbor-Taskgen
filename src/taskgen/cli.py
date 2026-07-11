@@ -16,7 +16,14 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
-from taskgen.common import project_root, render_template, resolve_display_path, validate_path_segment
+from taskgen.common import (
+    pipeline_activity_lock,
+    project_root,
+    render_template,
+    resolve_display_path,
+    validate_idea_identifier,
+    validate_seed_identifier,
+)
 from taskgen.config import EFFORT_LEVELS
 
 
@@ -358,14 +365,14 @@ def run_or_skip_phase(
 
 
 def load_pipeline_idea_ids(root: Path, seed_id: str) -> list[str]:
-    errors = validate_path_segment(seed_id, "seed_id")
+    errors = validate_seed_identifier(seed_id)
     if errors:
         raise SystemExit("; ".join(errors))
 
     brainstorm_path = root / "runs/brainstorm" / seed_id / "seed_brainstorm.json"
     try:
         payload = json.loads(brainstorm_path.read_text(encoding="utf-8"))
-    except OSError as exc:
+    except (OSError, UnicodeError) as exc:
         raise SystemExit(f"cannot read phase1 brainstorm output: {brainstorm_path}: {exc}") from None
     except json.JSONDecodeError as exc:
         raise SystemExit(f"invalid JSON in phase1 brainstorm output: {brainstorm_path}: {exc}") from None
@@ -381,7 +388,7 @@ def load_pipeline_idea_ids(root: Path, seed_id: str) -> list[str]:
         idea_id = idea.get("idea_id")
         if not isinstance(idea_id, str) or not idea_id.strip():
             raise SystemExit(f"phase1 brainstorm idea at index {index} has no idea_id")
-        id_errors = validate_path_segment(idea_id, f"ideas[{index}].idea_id")
+        id_errors = validate_idea_identifier(idea_id)
         if id_errors:
             raise SystemExit("; ".join(id_errors))
         if idea_id not in idea_ids:
@@ -400,7 +407,7 @@ def review_decision_for(root: Path, seed_id: str, idea_id: str) -> str:
     review_path = root / "runs/reviews" / f"{seed_id}__{idea_id}" / "review.json"
     try:
         payload = json.loads(review_path.read_text(encoding="utf-8"))
-    except OSError as exc:
+    except (OSError, UnicodeError) as exc:
         raise SystemExit(f"cannot read phase5 review output: {review_path}: {exc}") from None
     except json.JSONDecodeError as exc:
         raise SystemExit(f"invalid JSON in phase5 review output: {review_path}: {exc}") from None
@@ -415,7 +422,7 @@ def phase4_status_passed_for(root: Path, seed_id: str, idea_id: str) -> bool | N
     status_path = root / "runs/oracle-nop-check" / f"{seed_id}__{idea_id}" / "oracle-nop-status.json"
     try:
         payload = json.loads(status_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+    except (OSError, UnicodeError, json.JSONDecodeError):
         return None
     if not isinstance(payload, dict):
         return None
@@ -538,10 +545,15 @@ def run_pipeline_idea(
         force_dynamic = True
 
 
-def command_pipeline(args: argparse.Namespace) -> int:
+def _command_pipeline_with_activity_lock(args: argparse.Namespace) -> int:
     root = project_root()
     if args.max_repairs < 0:
         raise SystemExit("--max-repairs must be >= 0")
+    id_errors = validate_seed_identifier(args.seed_id)
+    if args.idea_id:
+        id_errors.extend(validate_idea_identifier(args.idea_id))
+    if id_errors:
+        raise SystemExit("; ".join(id_errors))
     phase1_count_mismatch = (
         args.idea_count is not None
         and not pipeline_phase1_count_matches(root, args.seed_id, args.idea_count)
@@ -585,7 +597,7 @@ def command_pipeline(args: argparse.Namespace) -> int:
                 "pipeline: dry-run cannot infer idea ids because phase1 would run; "
                 "pass --idea-id or run phase1 first"
             )
-            return 0
+            return 1
         if args.dry_run:
             try:
                 idea_ids = load_pipeline_idea_ids(root, args.seed_id)
@@ -594,7 +606,7 @@ def command_pipeline(args: argparse.Namespace) -> int:
                     "pipeline: dry-run cannot infer idea ids until phase1 output exists; "
                     "pass --idea-id or run phase1 first"
                 )
-                return 0
+                return 1
         else:
             idea_ids = load_pipeline_idea_ids(root, args.seed_id)
 
@@ -618,6 +630,11 @@ def command_pipeline(args: argparse.Namespace) -> int:
             print(f"- {idea_id}: exit code {exit_code}", file=sys.stderr)
         return 1
     return 0
+
+
+def command_pipeline(args: argparse.Namespace) -> int:
+    with pipeline_activity_lock(project_root()):
+        return _command_pipeline_with_activity_lock(args)
 
 
 def command_phases(_: argparse.Namespace) -> int:

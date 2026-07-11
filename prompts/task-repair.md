@@ -25,7 +25,12 @@ Required work:
 7. If Harbor is available, run one workspace-local oracle check and one workspace-local nop check against `output/task/`. Fix clear repair bugs before finishing when practical.
 8. Stop.
 
-Required output tree:
+Minimum required output skeleton:
+
+The repaired task may and should also contain task-specific source code, data,
+fixtures, configuration, and other files required by the task. Preserve such
+files from the input task unless a review item explicitly requires changing or
+removing them.
 
 ```text
 output/task/
@@ -45,7 +50,9 @@ Boundaries:
 - Do not modify files under `task/`, `review/`, or `oracle-nop-check/`.
 - Do not write outside `output/`.
 - Put optional validation logs and Harbor jobs only under `output/local-validation/`.
-- Keep `output/task/` limited to the required task tree.
+- Keep `output/task/` limited to the complete repaired task: the minimum
+  skeleton above plus task-specific files required for the task. Do not include
+  runner inputs, prompts, validation output, caches, or transient artifacts.
 - Use only the local validation commands described here when validating.
 - Do not include chain-of-thought in any output.
 

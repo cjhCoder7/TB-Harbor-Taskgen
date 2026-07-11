@@ -5,16 +5,23 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
+import re
 import sys
 from pathlib import Path
 from typing import Any
 
 from taskgen.common import (
     ValidationReport,
+    append_jsonl_object,
+    directory_tree_sha256,
     load_json,
+    phase_subject_lock,
     print_report,
     project_root,
+    read_jsonl_objects,
     require_object,
+    validate_path_segment,
 )
 from taskgen.harbor.oracle_nop import (
     command_run as run_oracle_nop_command,
@@ -58,14 +65,14 @@ def append_manifest_event(root: Path, seed_id: str, idea_id: str, payload: dict[
         "task_id": task_id,
         "task_path": generated_task_ref(seed_id, idea_id),
         "oracle_nop_ref": f"runs/oracle-nop-check/{task_id}/oracle-nop-status.json",
+        "run_id": payload.get("run_id"),
+        "task_tree_sha256": payload.get("task_tree_sha256"),
         "passed": payload.get("passed") is True,
         "status": "checked" if payload.get("passed") is True else "failed",
         "reason": "phase 4 Harbor oracle/nop check completed",
     }
     manifest_path = root / "runs/task-manifest.jsonl"
-    manifest_path.parent.mkdir(parents=True, exist_ok=True)
-    with manifest_path.open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps(event, ensure_ascii=False, sort_keys=True) + "\n")
+    append_jsonl_object(manifest_path, event)
 
 
 def validate_phase4(
@@ -119,7 +126,9 @@ def validate_status_payload(
     report: ValidationReport,
     *,
     require_passed: bool = True,
+    expected_status_task_path: Path | None = None,
 ) -> None:
+    expected_jobs_path: Path | None = None
     if payload.get("task_id") != task_id:
         report.errors.append(f"oracle/nop status task_id must be {task_id!r}")
 
@@ -128,24 +137,54 @@ def validate_status_payload(
         report.errors.append("$.task_path must be a non-empty string")
     else:
         candidate = Path(status_task_path)
+        recorded_task_path = expected_status_task_path or task_path
         report.checked_paths.append(str(candidate))
         try:
-            if candidate.resolve() != task_path.resolve():
+            if candidate.resolve() != recorded_task_path.resolve():
                 report.errors.append(
                     f"oracle/nop status task_path does not match generated task: {status_task_path}"
                 )
-        except OSError:
+        except (OSError, RuntimeError):
             report.errors.append(f"oracle/nop status task_path cannot be resolved: {status_task_path}")
 
     run_id = payload.get("run_id")
     if not isinstance(run_id, str) or not run_id.strip():
         report.errors.append("$.run_id must be a non-empty string")
+        run_id = None
+    elif validate_path_segment(run_id, "$.run_id"):
+        report.errors.extend(validate_path_segment(run_id, "$.run_id"))
+
+    expected_hash = payload.get("task_tree_sha256")
+    if not isinstance(expected_hash, str) or not re.fullmatch(r"[0-9a-f]{64}", expected_hash):
+        report.errors.append("$.task_tree_sha256 must be a lowercase SHA-256 hex digest")
+    elif task_path.is_dir():
+        try:
+            actual_hash = directory_tree_sha256(task_path)
+        except (OSError, RuntimeError) as exc:
+            report.errors.append(f"cannot hash generated task directory: {exc}")
+        else:
+            if actual_hash != expected_hash:
+                report.errors.append(
+                    "oracle/nop status is stale: task tree changed after the recorded Harbor run"
+                )
 
     jobs_dir = payload.get("jobs_dir")
     if not isinstance(jobs_dir, str) or not jobs_dir.strip():
         report.errors.append("$.jobs_dir must be a non-empty string")
     else:
-        validate_existing_dir(Path(jobs_dir), "$.jobs_dir", report)
+        jobs_path = Path(jobs_dir)
+        validate_existing_dir(jobs_path, "$.jobs_dir", report)
+        if run_id is not None:
+            try:
+                expected_jobs_path = (
+                    root / "runs/oracle-nop-check" / task_id / "harbor-jobs" / run_id
+                ).resolve()
+                if jobs_path.resolve() != expected_jobs_path:
+                    report.errors.append(
+                        f"$.jobs_dir must match task_id/run_id: {expected_jobs_path}"
+                    )
+            except (OSError, RuntimeError) as exc:
+                report.errors.append(f"$.jobs_dir cannot be resolved: {exc}")
 
     passed = payload.get("passed")
     if not isinstance(passed, bool):
@@ -156,8 +195,37 @@ def validate_status_payload(
         report.warnings.append("phase4 oracle/nop did not pass; status is available for phase5 review")
 
     require_success = require_passed or passed is True
-    validate_harbor_check(payload.get("oracle"), "oracle", 1.0, report, require_success=require_success)
-    validate_harbor_check(payload.get("nop"), "nop", 0.0, report, require_success=require_success)
+    out_dir = root / "runs/oracle-nop-check" / task_id
+    validate_harbor_check(
+        payload.get("oracle"),
+        "oracle",
+        1.0,
+        report,
+        require_success=require_success,
+        expected_log=out_dir / "oracle.log",
+        expected_job_dir=expected_jobs_path / "oracle" if expected_jobs_path is not None else None,
+    )
+    validate_harbor_check(
+        payload.get("nop"),
+        "nop",
+        0.0,
+        report,
+        require_success=require_success,
+        expected_log=out_dir / "nop.log",
+        expected_job_dir=expected_jobs_path / "nop" if expected_jobs_path is not None else None,
+    )
+
+    oracle = payload.get("oracle")
+    nop = payload.get("nop")
+    if isinstance(oracle, dict) and isinstance(nop, dict) and isinstance(passed, bool):
+        computed_passed = (
+            oracle.get("exit_code") == 0
+            and nop.get("exit_code") == 0
+            and reward_equals(numeric_reward(oracle.get("reward")), 1.0)
+            and reward_equals(numeric_reward(nop.get("reward")), 0.0)
+        )
+        if passed != computed_passed:
+            report.errors.append("$.passed does not match the recorded Harbor check results")
 
 
 def validate_harbor_check(
@@ -167,6 +235,8 @@ def validate_harbor_check(
     report: ValidationReport,
     *,
     require_success: bool = True,
+    expected_log: Path | None = None,
+    expected_job_dir: Path | None = None,
 ) -> None:
     path = f"$.{agent}"
     if not isinstance(value, dict):
@@ -179,6 +249,23 @@ def validate_harbor_check(
     elif require_success and exit_code != 0:
         report.errors.append(f"{path}.exit_code must be 0")
 
+    timed_out = value.get("timed_out")
+    if not isinstance(timed_out, bool):
+        report.errors.append(f"{path}.timed_out must be a boolean")
+    elif timed_out and exit_code != 124:
+        report.errors.append(f"{path}.exit_code must be 124 when timed_out is true")
+    elif not timed_out and exit_code == 124:
+        report.errors.append(f"{path}.timed_out must be true when exit_code is 124")
+
+    timeout_sec = value.get("timeout_sec")
+    if (
+        not isinstance(timeout_sec, (int, float))
+        or isinstance(timeout_sec, bool)
+        or not math.isfinite(float(timeout_sec))
+        or float(timeout_sec) <= 0
+    ):
+        report.errors.append(f"{path}.timeout_sec must be a positive finite number")
+
     raw_reward = value.get("reward")
     reward = numeric_reward(raw_reward)
     if require_success and not reward_equals(reward, expected_reward):
@@ -190,13 +277,35 @@ def validate_harbor_check(
     if not isinstance(log, str) or not log.strip():
         report.errors.append(f"{path}.log must be a non-empty string")
     else:
-        validate_existing_file(Path(log), f"{path}.log", report)
+        log_path = Path(log)
+        validate_existing_file(log_path, f"{path}.log", report)
+        if expected_log is not None:
+            try:
+                if log_path.resolve() != expected_log.resolve():
+                    report.errors.append(f"{path}.log must be {expected_log}")
+            except (OSError, RuntimeError) as exc:
+                report.errors.append(f"{path}.log cannot be resolved safely: {exc}")
 
     job_dir = value.get("job_dir")
     if not isinstance(job_dir, str) or not job_dir.strip():
         report.errors.append(f"{path}.job_dir must be a non-empty string")
     else:
-        validate_existing_dir(Path(job_dir), f"{path}.job_dir", report)
+        job_path = Path(job_dir)
+        if expected_job_dir is not None:
+            try:
+                if job_path.resolve() != expected_job_dir.resolve():
+                    report.errors.append(f"{path}.job_dir must be {expected_job_dir}")
+            except (OSError, RuntimeError) as exc:
+                report.errors.append(f"{path}.job_dir cannot be resolved safely: {exc}")
+        if job_path.is_dir():
+            validate_existing_dir(job_path, f"{path}.job_dir", report)
+        elif require_success or exit_code == 0:
+            validate_existing_dir(job_path, f"{path}.job_dir", report)
+        else:
+            report.checked_paths.append(str(job_path))
+            report.warnings.append(
+                f"{path}.job_dir was not created by the failed Harbor check: {job_path}"
+            )
 
 
 def validate_existing_file(path: Path, label: str, report: ValidationReport) -> None:
@@ -227,16 +336,7 @@ def validate_manifest_event(
     task_id = expected_task_id(root, seed_id, idea_id)
     expected_ref = f"runs/oracle-nop-check/{task_id}/oracle-nop-status.json"
     found = False
-    for line_number, line in enumerate(manifest_path.read_text(encoding="utf-8").splitlines(), start=1):
-        if not line.strip():
-            continue
-        try:
-            event = json.loads(line)
-        except json.JSONDecodeError as exc:
-            report.errors.append(f"invalid JSONL at {manifest_path}:{line_number}: {exc}")
-            continue
-        if not isinstance(event, dict):
-            continue
+    for _line_number, event in read_jsonl_objects(manifest_path, report):
         if (
             event.get("event") == "checked"
             and event.get("seed_id") == seed_id
@@ -245,6 +345,9 @@ def validate_manifest_event(
             and event.get("task_path") == generated_task_ref(seed_id, idea_id)
             and event.get("oracle_nop_ref") == expected_ref
             and event.get("passed") == (payload.get("passed") is True)
+            and event.get("run_id") == payload.get("run_id")
+            and event.get("task_tree_sha256") == payload.get("task_tree_sha256")
+            and event.get("status") == ("checked" if payload.get("passed") is True else "failed")
         ):
             found = True
             break
@@ -261,6 +364,17 @@ def command_run(args: argparse.Namespace) -> int:
         print(f"scripts/run-harbor-oracle-nop.sh {task_ref} --task-id {task_id}")
         return 0
 
+    with phase_subject_lock(root, PHASE_KEY, task_id):
+        return run_phase4_locked(root, args, task_ref, task_id)
+
+
+def run_phase4_locked(
+    root: Path,
+    args: argparse.Namespace,
+    task_ref: str,
+    task_id: str,
+) -> int:
+
     phase3_report = validate_phase3(root, args.seed_id, args.idea_id)
     if not phase3_report.passed:
         print(
@@ -272,18 +386,30 @@ def command_run(args: argparse.Namespace) -> int:
             print(f"- {error}", file=sys.stderr)
         return 1
 
-    run_oracle_nop_command(
-        argparse.Namespace(task_path=task_ref, task_id=task_id)
+    run_oracle_nop_command(argparse.Namespace(task_path=task_ref, task_id=task_id))
+    pre_manifest_report = validate_phase4(
+        root,
+        args.seed_id,
+        args.idea_id,
+        require_manifest=False,
+        require_passed=False,
     )
+    if not pre_manifest_report.passed:
+        return print_report(pre_manifest_report, as_json=False)
+
     status_path = status_path_for(root, args.seed_id, args.idea_id)
-    if status_path.is_file():
-        try:
-            status_payload = json.loads(status_path.read_text(encoding="utf-8"))
-        except json.JSONDecodeError as exc:
-            print(f"cannot append phase4 manifest event; invalid status JSON: {exc}", file=sys.stderr)
-            return 1
-        if isinstance(status_payload, dict):
-            append_manifest_event(root, args.seed_id, args.idea_id, status_payload)
+    try:
+        status_payload = json.loads(status_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError) as exc:
+        print(f"cannot append phase4 manifest event; cannot read status: {exc}", file=sys.stderr)
+        return 1
+    except json.JSONDecodeError as exc:
+        print(f"cannot append phase4 manifest event; invalid status JSON: {exc}", file=sys.stderr)
+        return 1
+    if not isinstance(status_payload, dict):
+        print("cannot append phase4 manifest event; status must be a JSON object", file=sys.stderr)
+        return 1
+    append_manifest_event(root, args.seed_id, args.idea_id, status_payload)
 
     validate_code = print_report(
         validate_phase4(root, args.seed_id, args.idea_id, require_passed=False),

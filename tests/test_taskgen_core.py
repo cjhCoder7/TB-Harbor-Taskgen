@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import signal
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -19,25 +20,49 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from taskgen.claude.cost import OpenRouterQueryError
+from taskgen.claude.cost import fetch_openrouter_generation_stats, read_float_env
 from taskgen.claude.cost import parse_claude_stream_log
 from taskgen.claude.cost import format_cost_summary
 from taskgen.claude.cost import summarize_claude_stream_log
-from taskgen.claude.runner import build_claude_command, run_claude_logged
+from taskgen.claude.runner import build_claude_command, run_claude_logged, run_claude_process
 from taskgen.claude.workspace import (
+    MissingWorkspaceOutputsError,
+    WorkspaceOutputError,
+    output_path_sha256,
+    output_sync_journal_path,
     phase_input_paths,
     phase_output_paths,
     prepare_workspace,
+    recover_interrupted_output_sync,
     sync_workspace_outputs,
 )
-from taskgen.cli import build_phase_process_command, get_phase, load_pipeline_idea_ids, pipeline_phase1_count_matches
+from taskgen.cli import (
+    PhaseRunResult,
+    build_phase_process_command,
+    command_pipeline,
+    get_phase,
+    load_pipeline_idea_ids,
+    pipeline_phase1_count_matches,
+)
 from taskgen.config import load_model_config, resolve_claude_code_path, resolve_effort_level
-from taskgen.common import ValidationReport
+from taskgen.common import (
+    ValidationReport,
+    append_jsonl_object,
+    delegated_phase_subject_lock_kwargs,
+    directory_tree_sha256,
+    phase_subject_lock,
+    phase_subject_lock_delegated_by_parent,
+    validate_claude_session_reference,
+)
+from taskgen.harbor.oracle_nop import extract_reward, run_harbor_check
+from taskgen.maintenance.clean_intermediate import clean_targets, command_clean
 from taskgen.phases.phase1_seed_brainstorm import render_phase1_prompt, validate_brainstorm_data
-from taskgen.phases.phase2_skillnet_research import validate_phase2
+from taskgen.phases.phase2_skillnet_research import render_phase2_prompt, validate_phase2
 from taskgen.phases.phase3_task_generation import render_phase3_prompt, validate_phase3
 from taskgen.phases.phase4_oracle_nop_check import (
     append_manifest_event as append_phase4_manifest_event,
     command_run as command_run_phase4,
+    validate_harbor_check,
     validate_phase4,
 )
 from taskgen.phases.phase5_task_review import (
@@ -52,11 +77,15 @@ from taskgen.phases.phase6_task_repair import (
     validate_new_session_synced_task,
 )
 from taskgen.phases.phase7_finalize import (
+    FinalizationError,
     accepted_task_path,
     append_manifest_event as append_phase7_manifest_event,
     ensure_phase7_inputs,
+    finalization_journal_path,
     move_final_task,
+    recover_interrupted_finalization,
     rejected_task_path,
+    run_phase7_locked,
     validate_phase7,
 )
 
@@ -64,8 +93,46 @@ from taskgen.phases.phase7_finalize import (
 def write_fake_claude_session(project: Path, phase: str, subject: str, run_id: str = "run-1") -> str:
     session = project / "runs/claude-sessions" / phase / subject / run_id
     session.mkdir(parents=True, exist_ok=True)
-    (session / "status.json").write_text(json.dumps({"exit_code": 0}), encoding="utf-8")
+    if phase == "seed-brainstorm":
+        synced_outputs = [f"runs/brainstorm/{subject}/seed_brainstorm.json"]
+    elif phase == "skillnet-research":
+        synced_outputs = [f"runs/skillnet/{subject}"]
+    elif phase == "task-generation":
+        seed_id, idea_id = subject.split("__", 1)
+        synced_outputs = [f"generated/working/{seed_id}/{idea_id}"]
+    elif phase == "task-review":
+        synced_outputs = [f"runs/reviews/{subject}"]
+    elif phase == "task-repair":
+        seed_id, idea_id = subject.split("__", 1)
+        synced_outputs = [f"generated/working/{seed_id}/{idea_id}"]
+    else:
+        raise AssertionError(f"unsupported fake Claude phase: {phase}")
+    (session / "status.json").write_text(
+        json.dumps(
+            {
+                "phase": phase,
+                "subject": subject,
+                "run_id": run_id,
+                "exit_code": 0,
+                "timed_out": False,
+                "synced_outputs": synced_outputs,
+            }
+        ),
+        encoding="utf-8",
+    )
     return session.relative_to(project).as_posix()
+
+
+def review_markdown_fixture(decision: str) -> str:
+    return (
+        "# Task review\n\n"
+        "## Summary\n\nReview summary.\n\n"
+        "## Modification items\n\n"
+        + ("Changes are listed in review.json.\n\n" if decision == "needs_modification" else "None.\n\n")
+        + "## Blocking reasons\n\n"
+        + ("The task concept is unsuitable.\n\n" if decision == "rejected" else "None.\n\n")
+        + f"## Final decision\n\n{decision}\n"
+    )
 
 
 def fake_claude_runner_fixture(
@@ -165,6 +232,37 @@ class ModelConfigTests(unittest.TestCase):
             config = load_model_config(Path(tmp))
 
         self.assertEqual(config.claude_code_timeout_sec, 1800.0)
+        self.assertEqual(config.harbor_check_timeout_sec, 10800.0)
+
+    def test_harbor_timeout_is_configurable_and_strictly_positive(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "model.json").write_text(
+                json.dumps({"harbor_check_timeout_sec": 42.5}),
+                encoding="utf-8",
+            )
+            self.assertEqual(load_model_config(root).harbor_check_timeout_sec, 42.5)
+
+        for invalid_timeout in (0, -1, True, "10800", float("nan"), float("inf")):
+            with self.subTest(invalid_timeout=invalid_timeout), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                (root / "model.json").write_text(
+                    json.dumps({"harbor_check_timeout_sec": invalid_timeout}),
+                    encoding="utf-8",
+                )
+                with self.assertRaisesRegex(SystemExit, "harbor_check_timeout_sec"):
+                    load_model_config(root)
+
+    def test_unknown_top_level_model_key_fails_fast(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "model.json").write_text(
+                json.dumps({"claude_timeout_sec": 1800}),
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(SystemExit, "unknown top-level key"):
+                load_model_config(root)
 
     def test_load_model_json_and_resolve_relative_claude_path(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -323,6 +421,58 @@ class ClaudeRunnerTests(unittest.TestCase):
         )
         killpg.assert_called_once_with(process.pid, signal.SIGKILL)
 
+    def test_successful_claude_with_missing_output_fails_without_overwriting_old_result(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace_payload, args = fake_claude_runner_fixture(root)
+            destination = root / "runs/brainstorm/seed-a/seed_brainstorm.json"
+            destination.parent.mkdir(parents=True)
+            destination.write_text("old-result", encoding="utf-8")
+            process = MagicMock()
+            process.wait.return_value = 0
+
+            with (
+                patch("taskgen.claude.runner.project_root", return_value=root),
+                patch("taskgen.claude.runner.run_id", return_value="run-1"),
+                patch("taskgen.claude.runner.prepare_workspace", return_value=workspace_payload),
+                patch("taskgen.claude.runner.build_claude_command", return_value=["claude"]),
+                patch("taskgen.claude.runner.subprocess.Popen", return_value=process),
+                patch("taskgen.claude.runner.write_status", return_value={}) as write_status,
+            ):
+                exit_code = run_claude_logged(args)
+
+            self.assertEqual(exit_code, 1)
+            self.assertEqual(destination.read_text(encoding="utf-8"), "old-result")
+            self.assertEqual(
+                write_status.call_args.kwargs["missing_outputs"],
+                ["output/seed_brainstorm.json"],
+            )
+            self.assertIn("missing declared workspace output", write_status.call_args.kwargs["output_sync_error"])
+            self.assertEqual(write_status.call_args.kwargs["synced_outputs"], [])
+
+    @unittest.skipUnless(os.name == "posix", "process-group cleanup requires POSIX")
+    def test_wait_exception_cleans_process_group_before_reraising(self) -> None:
+        process = MagicMock()
+        process.pid = 43210
+        process.wait.side_effect = [KeyboardInterrupt(), -signal.SIGKILL]
+
+        with (
+            tempfile.TemporaryFile("w+b") as log_handle,
+            patch("taskgen.claude.runner.subprocess.Popen", return_value=process),
+            patch("taskgen.claude.runner.os.killpg") as killpg,
+        ):
+            with self.assertRaises(KeyboardInterrupt):
+                run_claude_process(
+                    ["claude"],
+                    cwd=Path.cwd(),
+                    env={},
+                    log_handle=log_handle,
+                    timeout_sec=10,
+                )
+
+        killpg.assert_called_once_with(process.pid, signal.SIGKILL)
+        self.assertEqual(process.wait.call_args_list, [call(timeout=10), call()])
+
     @unittest.skipUnless(os.name == "posix", "process-group cleanup requires POSIX")
     def test_timeout_cleans_up_real_process_tree(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -448,6 +598,118 @@ class PipelineTests(unittest.TestCase):
                 "seed-a",
                 idea_count=4,
             )
+
+    def test_incomplete_pipeline_dry_run_returns_nonzero(self) -> None:
+        with (
+            tempfile.TemporaryDirectory() as project_tmp,
+            patch("taskgen.cli.project_root", return_value=Path(project_tmp)),
+            patch(
+                "taskgen.cli.run_or_skip_phase",
+                side_effect=[
+                    PhaseRunResult(exit_code=0, ran=True),
+                    PhaseRunResult(exit_code=0, ran=True),
+                ],
+            ),
+        ):
+            exit_code = command_pipeline(
+                SimpleNamespace(
+                    seed_id="seed-a",
+                    idea_id=None,
+                    idea_count=None,
+                    max_repairs=1,
+                    force=False,
+                    dry_run=True,
+                    model=None,
+                    effort=None,
+                )
+            )
+
+        self.assertEqual(exit_code, 1)
+
+
+class CommonHardeningTests(unittest.TestCase):
+    def test_phase_subject_lock_is_reentrant_in_same_thread(self) -> None:
+        with tempfile.TemporaryDirectory() as project_tmp:
+            project = Path(project_tmp)
+            reached_inner = False
+
+            with phase_subject_lock(project, "phase1", "seed-a"):
+                with phase_subject_lock(project, "phase2", "seed-a"):
+                    reached_inner = True
+
+            self.assertTrue(reached_inner)
+            self.assertEqual(len(list((project / "runs/locks").glob("subject-*.lock"))), 1)
+
+    def test_subject_lock_delegation_passes_actual_descriptors_through_wrapper(self) -> None:
+        with tempfile.TemporaryDirectory() as project_tmp:
+            project = Path(project_tmp)
+            with phase_subject_lock(project, "phase1", "seed-a"):
+                delegated = delegated_phase_subject_lock_kwargs(project, "seed-a")
+                environment = delegated["env"]
+                descriptors = delegated["pass_fds"]
+                existing_pythonpath = environment.get("PYTHONPATH")
+                environment["PYTHONPATH"] = str(SRC) + (
+                    f":{existing_pythonpath}" if existing_pythonpath else ""
+                )
+                child_code = (
+                    "import sys\n"
+                    "from pathlib import Path\n"
+                    "from taskgen.common import phase_subject_lock_delegated_by_parent\n"
+                    "root = Path(sys.argv[1])\n"
+                    "valid = phase_subject_lock_delegated_by_parent(root, 'seed-a')\n"
+                    "try:\n"
+                    "    phase_subject_lock_delegated_by_parent(root, 'seed-b')\n"
+                    "except RuntimeError:\n"
+                    "    wrong_rejected = True\n"
+                    "else:\n"
+                    "    wrong_rejected = False\n"
+                    "raise SystemExit(0 if valid and wrong_rejected else 1)\n"
+                )
+                completed = subprocess.run(
+                    [
+                        "bash",
+                        "-c",
+                        'exec "$@"',
+                        "bash",
+                        sys.executable,
+                        "-c",
+                        child_code,
+                        str(project),
+                    ],
+                    check=False,
+                    capture_output=True,
+                    env=environment,
+                    pass_fds=descriptors,
+                )
+
+                self.assertEqual(completed.returncode, 0, completed.stderr.decode())
+                self.assertEqual(len(descriptors), 2)
+                for descriptor in descriptors:
+                    os.fstat(descriptor)
+
+    def test_invalid_subject_lock_delegation_fails_fast(self) -> None:
+        with tempfile.TemporaryDirectory() as project_tmp, patch.dict(
+            os.environ,
+            {"_TASKGEN_PARENT_PHASE_SUBJECT_LOCK": "{}"},
+            clear=True,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "invalid inherited"):
+                phase_subject_lock_delegated_by_parent(Path(project_tmp), "seed-a")
+
+    def test_manifest_unlock_failure_after_fsync_does_not_report_append_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as project_tmp:
+            manifest = Path(project_tmp) / "runs/task-manifest.jsonl"
+
+            def fail_only_unlock(_fd: int, operation: int) -> None:
+                import fcntl
+
+                if operation == fcntl.LOCK_UN:
+                    raise OSError("simulated unlock failure")
+
+            with patch("taskgen.common.fcntl.flock", side_effect=fail_only_unlock):
+                append_jsonl_object(manifest, {"event": "accepted"})
+
+            self.assertEqual(json.loads(manifest.read_text(encoding="utf-8"))["event"], "accepted")
 
 
 class ClaudeWorkspaceTests(unittest.TestCase):
@@ -613,6 +875,349 @@ class ClaudeWorkspaceTests(unittest.TestCase):
                 repair_prompt.read_text(encoding="utf-8"),
                 "Repair from review/seed-a__idea-1 for task/seed-a/idea-1.",
             )
+
+    def test_missing_declared_output_preserves_existing_project_output(self) -> None:
+        with tempfile.TemporaryDirectory() as project_tmp:
+            project = Path(project_tmp)
+            workspace = project / "runs/workspace/seed-brainstorm/seed-a/run-1"
+            workspace.mkdir(parents=True)
+            destination = project / "runs/brainstorm/seed-a/seed_brainstorm.json"
+            destination.parent.mkdir(parents=True)
+            destination.write_text("old-result", encoding="utf-8")
+
+            with self.assertRaises(MissingWorkspaceOutputsError) as raised:
+                sync_workspace_outputs(project, workspace, "seed-brainstorm", "seed-a")
+
+            self.assertEqual(raised.exception.missing_outputs, ["output/seed_brainstorm.json"])
+            self.assertEqual(destination.read_text(encoding="utf-8"), "old-result")
+
+    def test_interrupted_output_sync_restores_backup_before_missing_output_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as project_tmp:
+            project = Path(project_tmp)
+            workspace = project / "runs/workspace/seed-brainstorm/seed-a/run-2"
+            workspace.mkdir(parents=True)
+            destination = project / "runs/brainstorm/seed-a/seed_brainstorm.json"
+            destination.parent.mkdir(parents=True)
+            destination.write_text("old-result", encoding="utf-8")
+            token = "123-" + "a" * 32
+            stage = destination.parent / f".taskgen-output-stage-{token}-0"
+            backup = destination.parent / f".taskgen-output-backup-{token}-0"
+            stage.write_text("partial-new-result", encoding="utf-8")
+            os.replace(destination, backup)
+            journal = output_sync_journal_path(project, "seed-brainstorm", "seed-a")
+            journal.parent.mkdir(parents=True)
+            journal.write_text(
+                json.dumps(
+                    {
+                        "phase": "seed-brainstorm",
+                        "subject": "seed-a",
+                        "state": "staged",
+                        "token": token,
+                        "records": [
+                            {
+                                "project_rel_path": "runs/brainstorm/seed-a/seed_brainstorm.json",
+                                "destination": str(destination),
+                                "stage": str(stage),
+                                "backup": str(backup),
+                                "destination_existed": True,
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with self.assertRaises(MissingWorkspaceOutputsError):
+                sync_workspace_outputs(project, workspace, "seed-brainstorm", "seed-a")
+
+            self.assertEqual(destination.read_text(encoding="utf-8"), "old-result")
+            self.assertFalse(stage.exists())
+            self.assertFalse(backup.exists())
+            self.assertFalse(journal.exists())
+
+    def test_committed_output_sync_restores_backup_when_destination_digest_is_invalid(self) -> None:
+        with tempfile.TemporaryDirectory() as project_tmp:
+            project = Path(project_tmp)
+            workspace = project / "runs/workspace/seed-brainstorm/seed-a/run-2"
+            workspace.mkdir(parents=True)
+            destination = project / "runs/brainstorm/seed-a/seed_brainstorm.json"
+            destination.parent.mkdir(parents=True)
+            destination.write_text("corrupted-new-result", encoding="utf-8")
+            token = "123-" + "c" * 32
+            stage = destination.parent / f".taskgen-output-stage-{token}-0"
+            backup = destination.parent / f".taskgen-output-backup-{token}-0"
+            backup.write_text("old-result", encoding="utf-8")
+            journal = output_sync_journal_path(project, "seed-brainstorm", "seed-a")
+            journal.parent.mkdir(parents=True)
+            journal.write_text(
+                json.dumps(
+                    {
+                        "phase": "seed-brainstorm",
+                        "subject": "seed-a",
+                        "state": "committed",
+                        "token": token,
+                        "records": [
+                            {
+                                "project_rel_path": "runs/brainstorm/seed-a/seed_brainstorm.json",
+                                "destination": str(destination),
+                                "stage": str(stage),
+                                "backup": str(backup),
+                                "destination_existed": True,
+                                "output_sha256": "0" * 64,
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with self.assertRaises(MissingWorkspaceOutputsError):
+                sync_workspace_outputs(project, workspace, "seed-brainstorm", "seed-a")
+
+            self.assertEqual(destination.read_text(encoding="utf-8"), "old-result")
+            self.assertFalse(backup.exists())
+            self.assertFalse(journal.exists())
+
+    def test_multi_output_recovery_does_not_partially_roll_back_without_every_backup(self) -> None:
+        with tempfile.TemporaryDirectory() as project_tmp:
+            project = Path(project_tmp)
+            first = project / "out/first.json"
+            second = project / "out/second.json"
+            first.parent.mkdir(parents=True)
+            first.write_text("new-first", encoding="utf-8")
+            second.write_text("new-second", encoding="utf-8")
+            token = "123-" + "e" * 32
+            first_stage = first.parent / f".taskgen-output-stage-{token}-0"
+            second_stage = second.parent / f".taskgen-output-stage-{token}-1"
+            first_backup = first.parent / f".taskgen-output-backup-{token}-0"
+            second_backup = second.parent / f".taskgen-output-backup-{token}-1"
+            first_backup.write_text("old-first", encoding="utf-8")
+            journal = output_sync_journal_path(project, "test-phase", "subject")
+            journal.parent.mkdir(parents=True)
+            journal.write_text(
+                json.dumps(
+                    {
+                        "phase": "test-phase",
+                        "subject": "subject",
+                        "state": "committed",
+                        "token": token,
+                        "records": [
+                            {
+                                "project_rel_path": "out/first.json",
+                                "destination": str(first),
+                                "stage": str(first_stage),
+                                "backup": str(first_backup),
+                                "destination_existed": True,
+                                "output_sha256": "0" * 64,
+                            },
+                            {
+                                "project_rel_path": "out/second.json",
+                                "destination": str(second),
+                                "stage": str(second_stage),
+                                "backup": str(second_backup),
+                                "destination_existed": True,
+                                "output_sha256": output_path_sha256(second),
+                            },
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            destinations = [
+                {"project_rel_path": "out/first.json", "destination": first},
+                {"project_rel_path": "out/second.json", "destination": second},
+            ]
+
+            with self.assertRaisesRegex(WorkspaceOutputError, "cannot atomically roll back"):
+                recover_interrupted_output_sync(
+                    project,
+                    "test-phase",
+                    "subject",
+                    destinations,
+                )
+
+            self.assertEqual(first.read_text(encoding="utf-8"), "new-first")
+            self.assertEqual(second.read_text(encoding="utf-8"), "new-second")
+            self.assertEqual(first_backup.read_text(encoding="utf-8"), "old-first")
+            self.assertTrue(journal.is_file())
+
+    def test_publish_failure_rolls_back_existing_output(self) -> None:
+        with tempfile.TemporaryDirectory() as project_tmp:
+            project = Path(project_tmp)
+            workspace = project / "runs/workspace/seed-brainstorm/seed-a/run-1"
+            source = workspace / "output/seed_brainstorm.json"
+            source.parent.mkdir(parents=True)
+            source.write_text("new-result", encoding="utf-8")
+            destination = project / "runs/brainstorm/seed-a/seed_brainstorm.json"
+            destination.parent.mkdir(parents=True)
+            destination.write_text("old-result", encoding="utf-8")
+            real_replace = os.replace
+
+            def fail_stage_install(source_path: object, destination_path: object) -> None:
+                source_candidate = Path(os.fspath(source_path))
+                destination_candidate = Path(os.fspath(destination_path))
+                if (
+                    source_candidate.name.startswith(".taskgen-output-stage-")
+                    and destination_candidate == destination
+                ):
+                    raise OSError("simulated publish failure")
+                real_replace(source_path, destination_path)
+
+            with (
+                patch("taskgen.claude.workspace.os.replace", side_effect=fail_stage_install),
+                self.assertRaisesRegex(WorkspaceOutputError, "failed to publish"),
+            ):
+                sync_workspace_outputs(project, workspace, "seed-brainstorm", "seed-a")
+
+            self.assertEqual(destination.read_text(encoding="utf-8"), "old-result")
+            self.assertEqual(list(destination.parent.glob(".taskgen-*")), [])
+
+    def test_stage_fsync_failure_preserves_existing_output(self) -> None:
+        with tempfile.TemporaryDirectory() as project_tmp:
+            project = Path(project_tmp)
+            workspace = project / "runs/workspace/seed-brainstorm/seed-a/run-1"
+            source = workspace / "output/seed_brainstorm.json"
+            source.parent.mkdir(parents=True)
+            source.write_text("new-result", encoding="utf-8")
+            destination = project / "runs/brainstorm/seed-a/seed_brainstorm.json"
+            destination.parent.mkdir(parents=True)
+            destination.write_text("old-result", encoding="utf-8")
+
+            with (
+                patch(
+                    "taskgen.claude.workspace.fsync_path_tree",
+                    side_effect=OSError("simulated fsync failure"),
+                ),
+                self.assertRaisesRegex(WorkspaceOutputError, "failed to stage"),
+            ):
+                sync_workspace_outputs(project, workspace, "seed-brainstorm", "seed-a")
+
+            self.assertEqual(destination.read_text(encoding="utf-8"), "old-result")
+            self.assertEqual(list(destination.parent.glob(".taskgen-*")), [])
+            self.assertFalse(output_sync_journal_path(project, "seed-brainstorm", "seed-a").exists())
+
+    @unittest.skipUnless(hasattr(os, "symlink"), "symbolic links are unavailable")
+    def test_workspace_output_symlink_is_rejected_without_overwrite(self) -> None:
+        with tempfile.TemporaryDirectory() as project_tmp:
+            project = Path(project_tmp)
+            workspace = project / "runs/workspace/seed-brainstorm/seed-a/run-1"
+            source = workspace / "output/seed_brainstorm.json"
+            source.parent.mkdir(parents=True)
+            actual = workspace / "actual.json"
+            actual.write_text("new-result", encoding="utf-8")
+            source.symlink_to(actual)
+            destination = project / "runs/brainstorm/seed-a/seed_brainstorm.json"
+            destination.parent.mkdir(parents=True)
+            destination.write_text("old-result", encoding="utf-8")
+
+            with self.assertRaisesRegex(WorkspaceOutputError, "symbolic links are not allowed"):
+                sync_workspace_outputs(project, workspace, "seed-brainstorm", "seed-a")
+
+            self.assertEqual(destination.read_text(encoding="utf-8"), "old-result")
+
+    def test_subject_ids_reject_reserved_separator_dot_segments_and_excessive_length(self) -> None:
+        invalid_calls = (
+            ("seed-brainstorm", "."),
+            ("seed-brainstorm", ".."),
+            ("seed-brainstorm", "seed__part"),
+            ("seed-brainstorm", "s" * 129),
+            ("task-generation", "seed-a__."),
+            ("task-generation", "seed-a__.."),
+            ("task-generation", "seed-a__idea__part"),
+            ("task-generation", f"seed-a__{'i' * 121}"),
+        )
+        for phase, subject in invalid_calls:
+            with self.subTest(phase=phase, subject=subject), self.assertRaises(SystemExit):
+                phase_output_paths(phase, subject)
+
+    def test_prepare_rejects_reused_or_invalid_run_id(self) -> None:
+        with tempfile.TemporaryDirectory() as project_tmp:
+            project = Path(project_tmp)
+            prompt = project / "prompts/seed-brainstorm.md"
+            prompt.parent.mkdir()
+            prompt.write_text("prompt", encoding="utf-8")
+            (project / "seeds/seed-a").mkdir(parents=True)
+
+            for invalid_run_id in (".", "..", "r" * 129):
+                with self.subTest(run_id=invalid_run_id), self.assertRaises(SystemExit):
+                    prepare_workspace(
+                        project,
+                        "seed-brainstorm",
+                        "seed-a",
+                        prompt,
+                        invalid_run_id,
+                    )
+
+            existing = project / "runs/claude-sessions/seed-brainstorm/seed-a/run-1"
+            existing.mkdir(parents=True)
+            with self.assertRaisesRegex(SystemExit, "already exists"):
+                prepare_workspace(project, "seed-brainstorm", "seed-a", prompt, "run-1")
+
+
+class ClaudeSessionReferenceTests(unittest.TestCase):
+    def test_valid_session_requires_exact_success_status_and_outputs(self) -> None:
+        with tempfile.TemporaryDirectory() as project_tmp:
+            project = Path(project_tmp)
+            session_ref = write_fake_claude_session(
+                project,
+                "task-review",
+                "seed-a__idea-1",
+            )
+            expected_outputs = ["runs/reviews/seed-a__idea-1"]
+
+            self.assertEqual(
+                validate_claude_session_reference(
+                    project,
+                    session_ref,
+                    expected_phase="task-review",
+                    expected_subject="seed-a__idea-1",
+                    expected_outputs=expected_outputs,
+                ),
+                [],
+            )
+
+            status_path = project / session_ref / "status.json"
+            status = json.loads(status_path.read_text(encoding="utf-8"))
+            status.update(
+                {
+                    "exit_code": 1,
+                    "timed_out": True,
+                    "synced_outputs": ["generated/working/seed-a/idea-1"],
+                }
+            )
+            status_path.write_text(json.dumps(status), encoding="utf-8")
+
+            errors = validate_claude_session_reference(
+                project,
+                session_ref,
+                expected_phase="task-review",
+                expected_subject="seed-a__idea-1",
+                expected_outputs=expected_outputs,
+            )
+            combined = "\n".join(errors)
+            self.assertIn("exit_code must be 0", combined)
+            self.assertIn("timed_out must be false", combined)
+            self.assertIn("synced_outputs must exactly equal", combined)
+
+    @unittest.skipUnless(hasattr(os, "symlink"), "symbolic links are unavailable")
+    def test_session_reference_cannot_escape_expected_session_root(self) -> None:
+        with tempfile.TemporaryDirectory() as project_tmp, tempfile.TemporaryDirectory() as outside_tmp:
+            project = Path(project_tmp)
+            outside = Path(outside_tmp)
+            (outside / "status.json").write_text("{}", encoding="utf-8")
+            link = project / "runs/claude-sessions/task-review/seed-a__idea-1/run-1"
+            link.parent.mkdir(parents=True)
+            link.symlink_to(outside, target_is_directory=True)
+
+            errors = validate_claude_session_reference(
+                project,
+                link.relative_to(project).as_posix(),
+                expected_phase="task-review",
+                expected_subject="seed-a__idea-1",
+                expected_outputs=["runs/reviews/seed-a__idea-1"],
+            )
+
+            self.assertIn("must stay inside the project", "\n".join(errors))
 
 
 class ClaudeCostTests(unittest.TestCase):
@@ -803,6 +1408,68 @@ class ClaudeCostTests(unittest.TestCase):
             "model=test/model, cost=$1.250000, turns=3, duration=12.5s, result=success",
         )
 
+    def test_successful_generation_missing_cost_does_not_override_stream_cost(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            log_path = Path(tmp) / "claude-code.txt"
+            log_path.write_text(
+                "\n".join(
+                    [
+                        json.dumps({"type": "assistant", "message": {"id": "gen-1"}}),
+                        json.dumps({"type": "assistant", "message": {"id": "gen-2"}}),
+                        json.dumps({"type": "result", "total_cost_usd": 2.0}),
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            def fake_fetch(generation_id: str, _api_key: str) -> dict[str, object]:
+                if generation_id == "gen-1":
+                    return {"id": generation_id, "total_cost": 0.25}
+                return {"id": generation_id, "model": "served/model"}
+
+            summary = summarize_claude_stream_log(
+                log_path,
+                openrouter_api_key="test-key",
+                fetch_openrouter_generation=fake_fetch,
+            )
+
+            self.assertEqual(summary["total_cost_usd"], 2.0)
+            self.assertEqual(summary["cost_source"], "claude_stream_log")
+            self.assertEqual(summary["openrouter_total_cost_usd"], 0.25)
+            self.assertFalse(summary["openrouter"]["cost_complete"])
+            self.assertEqual(summary["openrouter"]["valid_generation_cost_count"], 1)
+
+    def test_openrouter_generation_limit_reports_truncation(self) -> None:
+        stats = fetch_openrouter_generation_stats(
+            ["gen-1", "gen-2"],
+            "test-key",
+            fetch_generation=lambda generation_id, _key: {
+                "id": generation_id,
+                "total_cost": 0.5,
+            },
+            retry_count=0,
+            max_generation_count=1,
+            deadline_seconds=5,
+        )
+
+        self.assertTrue(stats["truncated"])
+        self.assertFalse(stats["complete"])
+        self.assertFalse(stats["cost_complete"])
+        self.assertEqual(stats["queried_generation_count"], 1)
+        self.assertEqual(stats["unqueried_generation_count"], 1)
+
+    def test_nonfinite_openrouter_float_environment_value_uses_default(self) -> None:
+        for raw_value in ("NaN", "Infinity", "-Infinity"):
+            with self.subTest(raw_value=raw_value), patch.dict(
+                os.environ,
+                {"TASKGEN_TEST_FLOAT": raw_value},
+            ):
+                self.assertEqual(
+                    read_float_env("TASKGEN_TEST_FLOAT", 3.5, 0.1, 10.0),
+                    3.5,
+                )
+
 
 class Phase1ValidationTests(unittest.TestCase):
     def test_render_phase1_prompt_uses_exact_idea_count(self) -> None:
@@ -924,6 +1591,115 @@ class Phase1ValidationTests(unittest.TestCase):
 
 
 class Phase2ValidationTests(unittest.TestCase):
+    def write_no_match_fixture(self, project: Path) -> tuple[Path, Path]:
+        seed_id = "seed-a"
+        idea_id = "idea-1"
+        brainstorm_dir = project / "runs/brainstorm" / seed_id
+        brainstorm_dir.mkdir(parents=True)
+        (brainstorm_dir / "seed_brainstorm.json").write_text(
+            json.dumps(
+                {
+                    "seed_id": seed_id,
+                    "source_path": "seed/seed-a",
+                    "task_understanding": "Understand the task.",
+                    "core_capabilities": ["Capability"],
+                    "ideas": [
+                        {
+                            "idea_id": idea_id,
+                            "title": "Idea title",
+                            "scenario": "Scenario",
+                            "core_transfer": "Transfer",
+                            "changed_dimensions": ["artifact", "scenario"],
+                            "expected_artifacts": ["/app/output.txt"],
+                            "verifier_sketch": "Check output.",
+                            "risk_notes": ["Risk"],
+                            "skillnet_queries": ["query"],
+                            "difficulty_profile": difficulty_profile_fixture(),
+                        }
+                    ],
+                    "avoid": ["Avoid"],
+                }
+            ),
+            encoding="utf-8",
+        )
+        skillnet_dir = project / "runs/skillnet" / seed_id
+        idea_dir = skillnet_dir / idea_id
+        (idea_dir / "skills").mkdir(parents=True)
+        (idea_dir / "raw").mkdir()
+        (idea_dir / "raw/search.txt").write_text("No useful results.", encoding="utf-8")
+        index_path = skillnet_dir / "skillnet_index.json"
+        index_path.write_text(
+            json.dumps(
+                {
+                    "seed_id": seed_id,
+                    "brainstorm_ref": "brainstorm/seed-a/seed_brainstorm.json",
+                    "generated_at": "2026-06-24T00:00:00Z",
+                    "ideas": [
+                        {
+                            "idea_id": idea_id,
+                            "title": "Idea title",
+                            "status": "no_strong_match",
+                            "skill_summary_ref": "skillnet/seed-a/idea-1/skill_summary.json",
+                            "skill_count": 0,
+                            "skill_names": [],
+                            "notes": ["No match"],
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        summary_path = idea_dir / "skill_summary.json"
+        summary_path.write_text(
+            json.dumps(
+                {
+                    "seed_id": seed_id,
+                    "idea_id": idea_id,
+                    "title": "Idea title",
+                    "status": "no_strong_match",
+                    "selected_skills": [],
+                    "tooling_notes": ["Tooling"],
+                    "environment_notes": ["Environment"],
+                    "verifier_notes": ["Verifier"],
+                    "implementation_risks": ["Risk"],
+                    "recommended_direction": "Proceed without a selected skill.",
+                    "difficulty_hardening": difficulty_hardening_fixture(),
+                }
+            ),
+            encoding="utf-8",
+        )
+        return index_path, summary_path
+
+    def test_rejects_boolean_skill_count(self) -> None:
+        with tempfile.TemporaryDirectory() as project_tmp:
+            project = Path(project_tmp)
+            index_path, _ = self.write_no_match_fixture(project)
+            index = json.loads(index_path.read_text(encoding="utf-8"))
+            index["ideas"][0]["skill_count"] = True
+            index_path.write_text(json.dumps(index), encoding="utf-8")
+
+            report = validate_phase2(project, "seed-a", require_manifest=False)
+
+            self.assertIn("skill_count must be an integer", "\n".join(report.errors))
+
+    def test_rejects_timestamp_without_timezone_and_title_drift(self) -> None:
+        with tempfile.TemporaryDirectory() as project_tmp:
+            project = Path(project_tmp)
+            index_path, summary_path = self.write_no_match_fixture(project)
+            index = json.loads(index_path.read_text(encoding="utf-8"))
+            index["generated_at"] = "2026-06-24T00:00:00"
+            index["ideas"][0]["title"] = "Changed title"
+            index_path.write_text(json.dumps(index), encoding="utf-8")
+            summary = json.loads(summary_path.read_text(encoding="utf-8"))
+            summary["title"] = "Changed title"
+            summary_path.write_text(json.dumps(summary), encoding="utf-8")
+
+            report = validate_phase2(project, "seed-a", require_manifest=False)
+            combined = "\n".join(report.errors)
+
+            self.assertIn("must include an ISO-8601 timezone offset", combined)
+            self.assertIn("title must exactly match the phase1 brainstorm title", combined)
+
     def test_validates_curated_skill_packages(self) -> None:
         with tempfile.TemporaryDirectory() as project_tmp:
             project = Path(project_tmp)
@@ -1109,6 +1885,25 @@ class Phase2ValidationTests(unittest.TestCase):
             report = validate_phase2(project, seed_id, require_manifest=False)
 
             self.assertEqual(report.errors, [])
+
+
+class PromptRenderingHardeningTests(unittest.TestCase):
+    def test_all_claude_prompt_renderers_reject_unknown_template_markers(self) -> None:
+        cases = (
+            ("seed-brainstorm.md", lambda root: render_phase1_prompt(root, "seed-a")),
+            ("skillnet-research.md", lambda root: render_phase2_prompt(root, "seed-a")),
+            ("task-review.md", lambda root: render_phase5_prompt(root, "seed-a", "idea-1")),
+            ("task-repair.md", lambda root: render_phase6_prompt(root, "seed-a", "idea-1")),
+        )
+        for filename, renderer in cases:
+            with self.subTest(filename=filename), tempfile.TemporaryDirectory() as project_tmp:
+                project = Path(project_tmp)
+                prompt = project / "prompts" / filename
+                prompt.parent.mkdir(parents=True)
+                prompt.write_text("Unresolved: {{UNKNOWN_MARKER}}", encoding="utf-8")
+
+                with self.assertRaisesRegex(SystemExit, "unreplaced marker"):
+                    renderer(project)
 
 
 class Phase3PromptTests(unittest.TestCase):
@@ -1442,6 +2237,77 @@ class Phase3ValidationTests(unittest.TestCase):
             self.assertIn("missing JSON file", "\n".join(report.errors))
 
 
+class HarborHardeningTests(unittest.TestCase):
+    def test_boolean_reward_is_not_numeric(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            result_path = root / "job/result.json"
+            result_path.parent.mkdir(parents=True)
+            result_path.write_text(
+                json.dumps({"verifier_result": {"rewards": {"reward": True}}}),
+                encoding="utf-8",
+            )
+
+            self.assertIsNone(extract_reward(root))
+
+            log = root / "oracle.log"
+            log.write_text("log", encoding="utf-8")
+            report = ValidationReport(phase="phase4", seed_id="seed-a")
+            validate_harbor_check(
+                {
+                    "exit_code": 0,
+                    "reward": True,
+                    "log": str(log),
+                    "job_dir": str(result_path.parent),
+                    "timed_out": False,
+                    "timeout_sec": 10,
+                },
+                "oracle",
+                1.0,
+                report,
+            )
+            self.assertIn("$.oracle.reward must be 1.0", report.errors)
+
+    @unittest.skipUnless(os.name == "posix", "process-group cleanup requires POSIX")
+    def test_harbor_timeout_records_status_and_kills_process_group(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            task = root / "task"
+            task.mkdir()
+            jobs = root / "jobs"
+            out = root / "out"
+            process = MagicMock()
+            process.pid = 54321
+            process.poll.return_value = None
+            process.wait.side_effect = [
+                subprocess.TimeoutExpired(cmd=["harbor"], timeout=2.5),
+                -signal.SIGKILL,
+            ]
+
+            with (
+                patch("taskgen.harbor.oracle_nop.subprocess.Popen", return_value=process) as popen,
+                patch("taskgen.harbor.oracle_nop.os.killpg") as killpg,
+            ):
+                result = run_harbor_check(
+                    ["harbor"],
+                    task,
+                    jobs,
+                    out,
+                    "oracle",
+                    "oracle",
+                    timeout_sec=2.5,
+                )
+
+            self.assertEqual(result.exit_code, 124)
+            self.assertTrue(result.timed_out)
+            self.assertEqual(result.timeout_sec, 2.5)
+            self.assertIsNone(result.reward)
+            self.assertIs(popen.call_args.kwargs["start_new_session"], True)
+            killpg.assert_called_once_with(process.pid, signal.SIGKILL)
+            self.assertEqual(process.wait.call_args_list, [call(timeout=2.5), call()])
+            self.assertIn("timed out after 2.5 seconds", result.log.read_text(encoding="utf-8"))
+
+
 class Phase4ValidationTests(unittest.TestCase):
     def write_generated_task(self, project: Path) -> Path:
         task = project / "generated/working/seed-a/idea-1"
@@ -1475,18 +2341,23 @@ class Phase4ValidationTests(unittest.TestCase):
             "task_id": task_id,
             "task_path": str(task.resolve()),
             "run_id": "run-1",
+            "task_tree_sha256": directory_tree_sha256(task),
             "passed": passed,
             "oracle": {
                 "exit_code": oracle_exit,
                 "reward": oracle_reward,
                 "log": str(oracle_log),
                 "job_dir": str(oracle_job),
+                "timed_out": oracle_exit == 124,
+                "timeout_sec": 10800.0,
             },
             "nop": {
                 "exit_code": nop_exit,
                 "reward": nop_reward,
                 "log": str(nop_log),
                 "job_dir": str(nop_job),
+                "timed_out": nop_exit == 124,
+                "timeout_sec": 10800.0,
             },
             "jobs_dir": str(jobs_dir),
         }
@@ -1502,6 +2373,17 @@ class Phase4ValidationTests(unittest.TestCase):
             report = validate_phase4(project, "seed-a", "idea-1")
 
             self.assertEqual(report.errors, [])
+
+    def test_rejects_stale_phase4_status_after_task_tree_changes(self) -> None:
+        with tempfile.TemporaryDirectory() as project_tmp:
+            project = Path(project_tmp)
+            task = self.write_generated_task(project)
+            self.write_phase4_status(project, task)
+            (task / "changed-after-check.txt").write_text("changed", encoding="utf-8")
+
+            report = validate_phase4(project, "seed-a", "idea-1")
+
+            self.assertIn("status is stale", "\n".join(report.errors))
 
     def test_uses_stable_pipeline_task_id_even_with_legacy_task_name(self) -> None:
         with tempfile.TemporaryDirectory() as project_tmp:
@@ -1620,18 +2502,23 @@ class Phase5ValidationTests(unittest.TestCase):
             "task_id": task_id,
             "task_path": str(task.resolve()),
             "run_id": "run-1",
+            "task_tree_sha256": directory_tree_sha256(task),
             "passed": passed,
             "oracle": {
                 "exit_code": oracle_exit,
                 "reward": oracle_reward,
                 "log": str(oracle_log),
                 "job_dir": str(oracle_job),
+                "timed_out": oracle_exit == 124,
+                "timeout_sec": 10800.0,
             },
             "nop": {
                 "exit_code": nop_exit,
                 "reward": nop_reward,
                 "log": str(nop_log),
                 "job_dir": str(nop_job),
+                "timed_out": nop_exit == 124,
+                "timeout_sec": 10800.0,
             },
             "jobs_dir": str(jobs_dir),
         }
@@ -1659,7 +2546,10 @@ class Phase5ValidationTests(unittest.TestCase):
         if extra:
             payload.update(extra)
         (review_dir / "review.json").write_text(json.dumps(payload), encoding="utf-8")
-        (review_dir / "review.md").write_text("Final decision: ready\n", encoding="utf-8")
+        (review_dir / "review.md").write_text(
+            review_markdown_fixture(decision),
+            encoding="utf-8",
+        )
         session_ref = write_fake_claude_session(project, "task-review", "seed-a__idea-1")
         append_phase5_manifest_event(project, "seed-a", "idea-1", decision, session_ref)
 
@@ -1676,6 +2566,51 @@ class Phase5ValidationTests(unittest.TestCase):
             report = validate_phase5(project, "seed-a", "idea-1")
 
             self.assertEqual(report.errors, [])
+
+    def test_review_is_invalidated_by_a_new_phase4_run_until_reviewed_again(self) -> None:
+        with tempfile.TemporaryDirectory() as project_tmp:
+            project = Path(project_tmp)
+            self.prepare_valid_inputs(project)
+            self.write_review(project)
+            status_path = project / "runs/oracle-nop-check/seed-a__idea-1/oracle-nop-status.json"
+            status = json.loads(status_path.read_text(encoding="utf-8"))
+            old_jobs = Path(status["jobs_dir"])
+            new_jobs = old_jobs.parent / "run-2"
+            os.replace(old_jobs, new_jobs)
+            status["run_id"] = "run-2"
+            status["jobs_dir"] = str(new_jobs)
+            status["oracle"]["job_dir"] = str(new_jobs / "oracle")
+            status["nop"]["job_dir"] = str(new_jobs / "nop")
+            status_path.write_text(json.dumps(status), encoding="utf-8")
+            append_phase4_manifest_event(project, "seed-a", "idea-1", status)
+
+            report = validate_phase5(project, "seed-a", "idea-1")
+
+            self.assertIn("no matching reviewed event", "\n".join(report.errors))
+
+    def test_rejects_review_markdown_decision_mismatch(self) -> None:
+        with tempfile.TemporaryDirectory() as project_tmp:
+            project = Path(project_tmp)
+            self.prepare_valid_inputs(project)
+            self.write_review(
+                project,
+                decision="needs_modification",
+                modification_items=[
+                    {
+                        "area": "instruction",
+                        "priority": "must_fix",
+                        "message": "Fix the instruction.",
+                        "evidence": ["instruction.md"],
+                        "repair_direction": "Rewrite it.",
+                    }
+                ],
+            )
+            review_md = project / "runs/reviews/seed-a__idea-1/review.md"
+            review_md.write_text(review_markdown_fixture("ready"), encoding="utf-8")
+
+            report = validate_phase5(project, "seed-a", "idea-1")
+
+            self.assertIn("same decision as review.json", "\n".join(report.errors))
 
     def test_validates_needs_modification_review(self) -> None:
         with tempfile.TemporaryDirectory() as project_tmp:
@@ -1812,18 +2747,23 @@ class Phase6RepairTests(unittest.TestCase):
             "task_id": task_id,
             "task_path": str(task.resolve()),
             "run_id": "run-1",
+            "task_tree_sha256": directory_tree_sha256(task),
             "passed": passed,
             "oracle": {
                 "exit_code": oracle_exit,
                 "reward": oracle_reward,
                 "log": str(oracle_log),
                 "job_dir": str(oracle_job),
+                "timed_out": oracle_exit == 124,
+                "timeout_sec": 10800.0,
             },
             "nop": {
                 "exit_code": nop_exit,
                 "reward": nop_reward,
                 "log": str(nop_log),
                 "job_dir": str(nop_job),
+                "timed_out": nop_exit == 124,
+                "timeout_sec": 10800.0,
             },
             "jobs_dir": str(jobs_dir),
         }
@@ -1865,7 +2805,10 @@ class Phase6RepairTests(unittest.TestCase):
             ),
             encoding="utf-8",
         )
-        (review_dir / "review.md").write_text(f"Final decision: {decision}\n", encoding="utf-8")
+        (review_dir / "review.md").write_text(
+            review_markdown_fixture(decision),
+            encoding="utf-8",
+        )
         session_ref = write_fake_claude_session(project, "task-review", "seed-a__idea-1")
         append_phase5_manifest_event(project, "seed-a", "idea-1", decision, session_ref)
 
@@ -1909,6 +2852,121 @@ class Phase6RepairTests(unittest.TestCase):
             self.assertIn("did not sync repaired task", "\n".join(errors))
 
 
+class CleanupHardeningTests(unittest.TestCase):
+    def test_cleanup_preserves_manifest_by_default_and_drops_only_when_explicit(self) -> None:
+        with tempfile.TemporaryDirectory() as project_tmp:
+            project = Path(project_tmp)
+            manifest = project / "runs/task-manifest.jsonl"
+            manifest.parent.mkdir(parents=True)
+            manifest.write_text('{"event":"audit"}\n', encoding="utf-8")
+            artifact = project / "runs/prompts/seed-a/prompt.md"
+            artifact.parent.mkdir(parents=True)
+            artifact.write_text("prompt", encoding="utf-8")
+
+            with patch("taskgen.maintenance.clean_intermediate.project_root", return_value=project):
+                exit_code = command_clean(
+                    SimpleNamespace(apply=True, drop_manifest=False, force_active=False)
+                )
+
+            self.assertEqual(exit_code, 0)
+            self.assertTrue(manifest.is_file())
+            self.assertFalse(artifact.exists())
+            self.assertNotIn(manifest, clean_targets(project))
+            self.assertIn(manifest, clean_targets(project, drop_manifest=True))
+
+            with patch("taskgen.maintenance.clean_intermediate.project_root", return_value=project):
+                exit_code = command_clean(
+                    SimpleNamespace(apply=True, drop_manifest=True, force_active=False)
+                )
+            self.assertEqual(exit_code, 0)
+            self.assertFalse(manifest.exists())
+
+    def test_cleanup_refuses_active_run_marker(self) -> None:
+        with tempfile.TemporaryDirectory() as project_tmp:
+            project = Path(project_tmp)
+            marker = project / "runs/claude-sessions/task-review/subject/run-1/.active"
+            marker.parent.mkdir(parents=True)
+            marker.write_text("{}", encoding="utf-8")
+            artifact = project / "runs/reviews/subject/review.json"
+            artifact.parent.mkdir(parents=True)
+            artifact.write_text("{}", encoding="utf-8")
+
+            with patch("taskgen.maintenance.clean_intermediate.project_root", return_value=project):
+                exit_code = command_clean(
+                    SimpleNamespace(apply=True, drop_manifest=False, force_active=False)
+                )
+
+            self.assertEqual(exit_code, 1)
+            self.assertTrue(marker.exists())
+            self.assertTrue(artifact.exists())
+
+    def test_cleanup_refuses_shared_pipeline_activity_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as project_tmp:
+            project = Path(project_tmp)
+            artifact = project / "runs/reviews/subject/review.json"
+            artifact.parent.mkdir(parents=True)
+            artifact.write_text("{}", encoding="utf-8")
+
+            with phase_subject_lock(project, "phase5", "subject"), patch(
+                "taskgen.maintenance.clean_intermediate.project_root",
+                return_value=project,
+            ):
+                exit_code = command_clean(
+                    SimpleNamespace(apply=True, drop_manifest=False, force_active=False)
+                )
+
+            self.assertEqual(exit_code, 1)
+            self.assertTrue(artifact.exists())
+
+    def test_cleanup_requires_explicit_override_for_pending_recovery_journal(self) -> None:
+        with tempfile.TemporaryDirectory() as project_tmp:
+            project = Path(project_tmp)
+            journal = project / "runs/finalization-transactions/pending.json"
+            journal.parent.mkdir(parents=True)
+            journal.write_text("{}", encoding="utf-8")
+
+            with patch("taskgen.maintenance.clean_intermediate.project_root", return_value=project):
+                refused = command_clean(
+                    SimpleNamespace(
+                        apply=True,
+                        drop_manifest=False,
+                        force_active=False,
+                        discard_transactions=False,
+                    )
+                )
+            self.assertEqual(refused, 1)
+            self.assertTrue(journal.exists())
+
+            with patch("taskgen.maintenance.clean_intermediate.project_root", return_value=project):
+                discarded = command_clean(
+                    SimpleNamespace(
+                        apply=True,
+                        drop_manifest=False,
+                        force_active=False,
+                        discard_transactions=True,
+                    )
+                )
+            self.assertEqual(discarded, 0)
+            self.assertFalse(journal.exists())
+
+    @unittest.skipUnless(hasattr(os, "symlink"), "symbolic links are unavailable")
+    def test_cleanup_unlinks_broken_directory_symlink_and_restores_skeleton(self) -> None:
+        with tempfile.TemporaryDirectory() as project_tmp:
+            project = Path(project_tmp)
+            reviews = project / "runs/reviews"
+            reviews.parent.mkdir(parents=True)
+            reviews.symlink_to(project / "missing-reviews", target_is_directory=True)
+
+            with patch("taskgen.maintenance.clean_intermediate.project_root", return_value=project):
+                exit_code = command_clean(
+                    SimpleNamespace(apply=True, drop_manifest=False, force_active=False)
+                )
+
+            self.assertEqual(exit_code, 0)
+            self.assertTrue(reviews.is_dir())
+            self.assertFalse(reviews.is_symlink())
+
+
 class Phase7FinalizeTests(unittest.TestCase):
     def write_generated_task(self, project: Path) -> Path:
         task = project / "generated/working/seed-a/idea-1"
@@ -1949,18 +3007,23 @@ class Phase7FinalizeTests(unittest.TestCase):
             "task_id": task_id,
             "task_path": str(task.resolve()),
             "run_id": "run-1",
+            "task_tree_sha256": directory_tree_sha256(task),
             "passed": passed,
             "oracle": {
                 "exit_code": oracle_exit,
                 "reward": oracle_reward,
                 "log": str(oracle_log),
                 "job_dir": str(oracle_job),
+                "timed_out": oracle_exit == 124,
+                "timeout_sec": 10800.0,
             },
             "nop": {
                 "exit_code": nop_exit,
                 "reward": nop_reward,
                 "log": str(nop_log),
                 "job_dir": str(nop_job),
+                "timed_out": nop_exit == 124,
+                "timeout_sec": 10800.0,
             },
             "jobs_dir": str(jobs_dir),
         }
@@ -2002,7 +3065,10 @@ class Phase7FinalizeTests(unittest.TestCase):
             ),
             encoding="utf-8",
         )
-        (review_dir / "review.md").write_text(f"Final decision: {decision}\n", encoding="utf-8")
+        (review_dir / "review.md").write_text(
+            review_markdown_fixture(decision),
+            encoding="utf-8",
+        )
         session_ref = write_fake_claude_session(project, "task-review", "seed-a__idea-1")
         append_phase5_manifest_event(project, "seed-a", "idea-1", decision, session_ref)
 
@@ -2069,6 +3135,372 @@ class Phase7FinalizeTests(unittest.TestCase):
             self.assertTrue(rejected_task_path(project, "seed-a", "idea-1").is_dir())
             self.assertFalse(accepted_task_path(project, "seed-a", "idea-1").exists())
             self.assertFalse(task.exists())
+
+    def test_rejected_finalization_accepts_reviewable_failed_phase4_status(self) -> None:
+        with tempfile.TemporaryDirectory() as project_tmp:
+            project = Path(project_tmp)
+            task = self.write_generated_task(project)
+            self.write_phase4_status(
+                project,
+                task,
+                passed=False,
+                oracle_reward=0.0,
+                nop_reward=1.0,
+                oracle_exit=1,
+            )
+            self.write_review(project, "rejected")
+
+            self.assertEqual(ensure_phase7_inputs(project, "seed-a", "idea-1"), [])
+            move_final_task(
+                task,
+                rejected_task_path(project, "seed-a", "idea-1"),
+                accepted_task_path(project, "seed-a", "idea-1"),
+            )
+            append_phase7_manifest_event(project, "seed-a", "idea-1", "rejected")
+
+            report = validate_phase7(project, "seed-a", "idea-1")
+            self.assertEqual(report.errors, [])
+            self.assertIn("available for phase5 review", "\n".join(report.warnings))
+
+    def test_phase7_manifest_failure_leaves_valid_final_for_recovery(self) -> None:
+        with tempfile.TemporaryDirectory() as project_tmp:
+            project = Path(project_tmp)
+            source = self.prepare_inputs(project, "ready")
+            accepted = accepted_task_path(project, "seed-a", "idea-1")
+            rejected = rejected_task_path(project, "seed-a", "idea-1")
+            accepted.mkdir(parents=True)
+            rejected.mkdir(parents=True)
+            (accepted / "old-accepted.txt").write_text("accepted", encoding="utf-8")
+            (rejected / "old-rejected.txt").write_text("rejected", encoding="utf-8")
+
+            with patch(
+                "taskgen.phases.phase7_finalize.append_manifest_event",
+                side_effect=FinalizationError("simulated manifest failure"),
+            ):
+                exit_code = run_phase7_locked(
+                    project,
+                    SimpleNamespace(seed_id="seed-a", idea_id="idea-1", dry_run=False),
+                )
+
+            self.assertEqual(exit_code, 1)
+            self.assertFalse(source.exists())
+            self.assertTrue((accepted / "task.toml").is_file())
+            self.assertFalse((accepted / "old-accepted.txt").exists())
+            self.assertFalse(rejected.exists())
+            transaction_artifacts = [
+                path
+                for root in (source.parent, accepted.parent, rejected.parent)
+                for path in root.glob(".*-*")
+            ]
+            self.assertEqual(transaction_artifacts, [])
+
+            recovery_exit = run_phase7_locked(
+                project,
+                SimpleNamespace(seed_id="seed-a", idea_id="idea-1", dry_run=False),
+            )
+            self.assertEqual(recovery_exit, 0)
+            self.assertEqual(validate_phase7(project, "seed-a", "idea-1").errors, [])
+
+    def test_phase7_stage_fsync_failure_rolls_back_without_switching_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as project_tmp:
+            project = Path(project_tmp)
+            source = self.prepare_inputs(project, "ready")
+            accepted = accepted_task_path(project, "seed-a", "idea-1")
+            rejected = rejected_task_path(project, "seed-a", "idea-1")
+            accepted.mkdir(parents=True)
+            rejected.mkdir(parents=True)
+            (accepted / "old.txt").write_text("accepted", encoding="utf-8")
+            (rejected / "old.txt").write_text("rejected", encoding="utf-8")
+
+            with patch(
+                "taskgen.phases.phase7_finalize.fsync_path_tree",
+                side_effect=OSError("simulated fsync failure"),
+            ):
+                exit_code = run_phase7_locked(
+                    project,
+                    SimpleNamespace(seed_id="seed-a", idea_id="idea-1", dry_run=False),
+                )
+
+            self.assertEqual(exit_code, 1)
+            self.assertTrue((source / "task.toml").is_file())
+            self.assertEqual((accepted / "old.txt").read_text(encoding="utf-8"), "accepted")
+            self.assertEqual((rejected / "old.txt").read_text(encoding="utf-8"), "rejected")
+            self.assertFalse(finalization_journal_path(project, source).exists())
+            transaction_artifacts = [
+                path
+                for root in (source.parent, accepted.parent, rejected.parent)
+                for path in root.glob(".*-*")
+            ]
+            self.assertEqual(transaction_artifacts, [])
+
+    def test_phase7_recovers_final_task_when_manifest_event_is_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as project_tmp:
+            project = Path(project_tmp)
+            source = self.prepare_inputs(project, "ready")
+            accepted = accepted_task_path(project, "seed-a", "idea-1")
+            rejected = rejected_task_path(project, "seed-a", "idea-1")
+            move_final_task(source, accepted, rejected)
+
+            exit_code = run_phase7_locked(
+                project,
+                SimpleNamespace(seed_id="seed-a", idea_id="idea-1", dry_run=False),
+            )
+
+            self.assertEqual(exit_code, 0)
+            self.assertEqual(validate_phase7(project, "seed-a", "idea-1").errors, [])
+            manifest_text = (project / "runs/task-manifest.jsonl").read_text(encoding="utf-8")
+            self.assertIn('"event": "accepted"', manifest_text)
+
+    def test_phase7_recovers_kill_interrupted_switch_and_cleans_hidden_backups(self) -> None:
+        with tempfile.TemporaryDirectory() as project_tmp:
+            project = Path(project_tmp)
+            source = self.prepare_inputs(project, "ready")
+            accepted = accepted_task_path(project, "seed-a", "idea-1")
+            rejected = rejected_task_path(project, "seed-a", "idea-1")
+            accepted.mkdir(parents=True)
+            rejected.mkdir(parents=True)
+            (accepted / "old.txt").write_text("accepted", encoding="utf-8")
+            (rejected / "old.txt").write_text("rejected", encoding="utf-8")
+            nonce = "b" * 32
+            stage = accepted.parent / f".taskgen-stage-{nonce}"
+            destination_backup = accepted.parent / f".taskgen-final-backup-{nonce}"
+            counterpart_backup = rejected.parent / f".taskgen-counterpart-backup-{nonce}"
+            source_backup = source.parent / f".taskgen-working-backup-{nonce}"
+            shutil.copytree(source, stage)
+            os.replace(accepted, destination_backup)
+            os.replace(rejected, counterpart_backup)
+            os.replace(stage, accepted)
+            os.replace(source, source_backup)
+            journal = finalization_journal_path(project, source)
+            journal.parent.mkdir(parents=True)
+            journal.write_text(
+                json.dumps(
+                    {
+                        "state": "switched",
+                        "source": str(source),
+                        "destination": str(accepted),
+                        "counterpart": str(rejected),
+                        "stage": str(stage),
+                        "destination_backup": str(destination_backup),
+                        "counterpart_backup": str(counterpart_backup),
+                        "source_backup": str(source_backup),
+                        "destination_existed": True,
+                        "counterpart_existed": True,
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            exit_code = run_phase7_locked(
+                project,
+                SimpleNamespace(seed_id="seed-a", idea_id="idea-1", dry_run=False),
+            )
+
+            self.assertEqual(exit_code, 0)
+            self.assertEqual(validate_phase7(project, "seed-a", "idea-1").errors, [])
+            self.assertFalse(source.exists())
+            self.assertFalse(rejected.exists())
+            self.assertFalse(journal.exists())
+            for temporary in (
+                stage,
+                destination_backup,
+                counterpart_backup,
+                source_backup,
+            ):
+                self.assertFalse(os.path.lexists(temporary))
+
+    def test_phase7_rolls_back_corrupted_interrupted_destination(self) -> None:
+        with tempfile.TemporaryDirectory() as project_tmp:
+            project = Path(project_tmp)
+            source = self.prepare_inputs(project, "ready")
+            accepted = accepted_task_path(project, "seed-a", "idea-1")
+            rejected = rejected_task_path(project, "seed-a", "idea-1")
+            accepted.mkdir(parents=True)
+            rejected.mkdir(parents=True)
+            (accepted / "old.txt").write_text("accepted", encoding="utf-8")
+            (rejected / "old.txt").write_text("rejected", encoding="utf-8")
+            nonce = "d" * 32
+            stage = accepted.parent / f".taskgen-stage-{nonce}"
+            destination_backup = accepted.parent / f".taskgen-final-backup-{nonce}"
+            counterpart_backup = rejected.parent / f".taskgen-counterpart-backup-{nonce}"
+            source_backup = source.parent / f".taskgen-working-backup-{nonce}"
+            shutil.copytree(source, stage)
+            os.replace(accepted, destination_backup)
+            os.replace(rejected, counterpart_backup)
+            os.replace(stage, accepted)
+            os.replace(source, source_backup)
+            (accepted / "task.toml").write_text('version = "corrupted"\n', encoding="utf-8")
+            journal = finalization_journal_path(project, source)
+            journal.parent.mkdir(parents=True)
+            journal.write_text(
+                json.dumps(
+                    {
+                        "state": "switched",
+                        "source": str(source),
+                        "destination": str(accepted),
+                        "counterpart": str(rejected),
+                        "stage": str(stage),
+                        "destination_backup": str(destination_backup),
+                        "counterpart_backup": str(counterpart_backup),
+                        "source_backup": str(source_backup),
+                        "destination_existed": True,
+                        "counterpart_existed": True,
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            recover_interrupted_finalization(
+                project,
+                source,
+                accepted,
+                rejected,
+                seed_id="seed-a",
+                idea_id="idea-1",
+            )
+
+            self.assertTrue((source / "task.toml").is_file())
+            self.assertEqual((accepted / "old.txt").read_text(encoding="utf-8"), "accepted")
+            self.assertEqual((rejected / "old.txt").read_text(encoding="utf-8"), "rejected")
+            self.assertFalse(journal.exists())
+            for temporary in (
+                stage,
+                destination_backup,
+                counterpart_backup,
+                source_backup,
+            ):
+                self.assertFalse(os.path.lexists(temporary))
+
+    def test_phase7_unrecoverable_rollback_leaves_every_path_untouched(self) -> None:
+        with tempfile.TemporaryDirectory() as project_tmp:
+            project = Path(project_tmp)
+            source = self.prepare_inputs(project, "ready")
+            accepted = accepted_task_path(project, "seed-a", "idea-1")
+            rejected = rejected_task_path(project, "seed-a", "idea-1")
+            accepted.mkdir(parents=True)
+            rejected.mkdir(parents=True)
+            (accepted / "old.txt").write_text("accepted", encoding="utf-8")
+            (rejected / "old.txt").write_text("rejected", encoding="utf-8")
+            nonce = "f" * 32
+            stage = accepted.parent / f".taskgen-stage-{nonce}"
+            destination_backup = accepted.parent / f".taskgen-final-backup-{nonce}"
+            counterpart_backup = rejected.parent / f".taskgen-counterpart-backup-{nonce}"
+            source_backup = source.parent / f".taskgen-working-backup-{nonce}"
+            shutil.copytree(source, stage)
+            os.replace(accepted, destination_backup)
+            os.replace(rejected, counterpart_backup)
+            os.replace(stage, accepted)
+            os.replace(source, source_backup)
+            shutil.rmtree(source_backup)
+            (accepted / "task.toml").write_text('version = "corrupted"\n', encoding="utf-8")
+            journal = finalization_journal_path(project, source)
+            journal.parent.mkdir(parents=True)
+            journal.write_text(
+                json.dumps(
+                    {
+                        "state": "switched",
+                        "source": str(source),
+                        "destination": str(accepted),
+                        "counterpart": str(rejected),
+                        "stage": str(stage),
+                        "destination_backup": str(destination_backup),
+                        "counterpart_backup": str(counterpart_backup),
+                        "source_backup": str(source_backup),
+                        "destination_existed": True,
+                        "counterpart_existed": True,
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(FinalizationError, "cannot be rolled back safely"):
+                recover_interrupted_finalization(
+                    project,
+                    source,
+                    accepted,
+                    rejected,
+                    seed_id="seed-a",
+                    idea_id="idea-1",
+                )
+
+            self.assertFalse(source.exists())
+            self.assertEqual(
+                (accepted / "task.toml").read_text(encoding="utf-8"),
+                'version = "corrupted"\n',
+            )
+            self.assertEqual(
+                (destination_backup / "old.txt").read_text(encoding="utf-8"),
+                "accepted",
+            )
+            self.assertEqual(
+                (counterpart_backup / "old.txt").read_text(encoding="utf-8"),
+                "rejected",
+            )
+            self.assertTrue(journal.is_file())
+
+    def test_phase7_committed_journal_with_working_source_is_left_for_manual_recovery(self) -> None:
+        with tempfile.TemporaryDirectory() as project_tmp:
+            project = Path(project_tmp)
+            source = self.prepare_inputs(project, "ready")
+            accepted = accepted_task_path(project, "seed-a", "idea-1")
+            rejected = rejected_task_path(project, "seed-a", "idea-1")
+            shutil.copytree(source, accepted)
+            nonce = "1" * 32
+            stage = accepted.parent / f".taskgen-stage-{nonce}"
+            destination_backup = accepted.parent / f".taskgen-final-backup-{nonce}"
+            counterpart_backup = rejected.parent / f".taskgen-counterpart-backup-{nonce}"
+            source_backup = source.parent / f".taskgen-working-backup-{nonce}"
+            journal = finalization_journal_path(project, source)
+            journal.parent.mkdir(parents=True)
+            journal.write_text(
+                json.dumps(
+                    {
+                        "state": "committed",
+                        "source": str(source),
+                        "destination": str(accepted),
+                        "counterpart": str(rejected),
+                        "stage": str(stage),
+                        "destination_backup": str(destination_backup),
+                        "counterpart_backup": str(counterpart_backup),
+                        "source_backup": str(source_backup),
+                        "destination_existed": False,
+                        "counterpart_existed": False,
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(FinalizationError, "unexpectedly retains a working task"):
+                recover_interrupted_finalization(
+                    project,
+                    source,
+                    accepted,
+                    rejected,
+                    seed_id="seed-a",
+                    idea_id="idea-1",
+                )
+
+            self.assertTrue((source / "task.toml").is_file())
+            self.assertTrue((accepted / "task.toml").is_file())
+            self.assertTrue(journal.is_file())
+
+    @unittest.skipUnless(hasattr(os, "symlink"), "symbolic links are unavailable")
+    def test_phase7_rejects_symlinked_final_parent_outside_project(self) -> None:
+        with tempfile.TemporaryDirectory() as project_tmp, tempfile.TemporaryDirectory() as outside_tmp:
+            project = Path(project_tmp)
+            source = self.prepare_inputs(project, "ready")
+            accepted_parent = project / "generated/accepted"
+            accepted_parent.parent.mkdir(parents=True, exist_ok=True)
+            accepted_parent.symlink_to(Path(outside_tmp), target_is_directory=True)
+
+            exit_code = run_phase7_locked(
+                project,
+                SimpleNamespace(seed_id="seed-a", idea_id="idea-1", dry_run=False),
+            )
+
+            self.assertEqual(exit_code, 1)
+            self.assertTrue(source.is_dir())
+            self.assertEqual(list(Path(outside_tmp).iterdir()), [])
 
 
 if __name__ == "__main__":

@@ -15,7 +15,6 @@ successfully.
 from __future__ import annotations
 
 import argparse
-import json
 import re
 import subprocess
 import sys
@@ -24,12 +23,19 @@ from typing import Any
 
 from taskgen.common import (
     ValidationReport,
+    append_jsonl_object,
+    delegated_phase_subject_lock_kwargs,
     load_json,
+    phase_subject_lock,
     print_report,
     project_root,
+    read_jsonl_objects,
     require_object,
     require_string,
-    validate_path_segment,
+    select_new_claude_session,
+    validate_claude_session_reference,
+    validate_idea_identifier,
+    validate_seed_identifier,
 )
 from taskgen.config import (
     EFFORT_LEVELS,
@@ -113,11 +119,11 @@ TEXT_SUFFIXES = {
 
 
 def validate_seed_id(seed_id: str) -> list[str]:
-    return validate_path_segment(seed_id, "seed_id")
+    return validate_seed_identifier(seed_id)
 
 
 def validate_idea_id(idea_id: str) -> list[str]:
-    return validate_path_segment(idea_id, "idea_id")
+    return validate_idea_identifier(idea_id)
 
 
 def subject_for(seed_id: str, idea_id: str) -> str:
@@ -156,12 +162,15 @@ def session_ref_for(root: Path, session_dir: Path) -> str:
 
 
 def find_new_session_ref(root: Path, seed_id: str, idea_id: str, before: set[Path]) -> str | None:
-    created = list(list_session_dirs(root, seed_id, idea_id) - before)
-    if not created:
-        return None
-
-    created.sort(key=lambda path: path.stat().st_mtime_ns, reverse=True)
-    return session_ref_for(root, created[0])
+    subject = subject_for(seed_id, idea_id)
+    session_dir, _ = select_new_claude_session(
+        root,
+        expected_phase=PHASE_NAME,
+        expected_subject=subject,
+        expected_outputs=[generated_task_ref_for(seed_id, idea_id)],
+        before=before,
+    )
+    return session_ref_for(root, session_dir) if session_dir is not None else None
 
 
 def generated_prompt_path_for(root: Path, seed_id: str, idea_id: str) -> Path:
@@ -174,7 +183,6 @@ def task_id_for(root: Path, seed_id: str, idea_id: str) -> str:
 
 def append_manifest_event(root: Path, seed_id: str, idea_id: str, claude_session_ref: str) -> None:
     manifest_path = root / "runs/task-manifest.jsonl"
-    manifest_path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "event": "generated",
         "seed_id": seed_id,
@@ -188,8 +196,7 @@ def append_manifest_event(root: Path, seed_id: str, idea_id: str, claude_session
         "status": "working",
         "reason": "phase 3 task generation completed",
     }
-    with manifest_path.open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n")
+    append_jsonl_object(manifest_path, payload)
 
 
 def ensure_phase3_inputs(root: Path, seed_id: str, idea_id: str) -> list[str]:
@@ -340,6 +347,9 @@ def validate_skillnet_index_for_idea(
 
 def validate_required_task_layout(task_path: Path, report: ValidationReport) -> None:
     report.checked_paths.append(str(task_path))
+    if task_path.is_symlink():
+        report.errors.append(f"generated task directory must not be a symlink: {task_path}")
+        return
     if not task_path.is_dir():
         report.errors.append(f"missing generated task directory: {task_path}")
         return
@@ -460,15 +470,7 @@ def validate_manifest_event(root: Path, seed_id: str, idea_id: str, report: Vali
     task_ref = generated_task_ref_for(seed_id, idea_id)
     found = False
     candidate_errors: list[str] = []
-    for line_number, line in enumerate(manifest_path.read_text(encoding="utf-8").splitlines(), start=1):
-        if not line.strip():
-            continue
-        try:
-            event = json.loads(line)
-        except json.JSONDecodeError as exc:
-            report.errors.append(f"invalid JSONL at {manifest_path}:{line_number}: {exc}")
-            continue
-
+    for line_number, event in read_jsonl_objects(manifest_path, report):
         if not (
             event.get("event") == "generated"
             and event.get("seed_id") == seed_id
@@ -511,20 +513,20 @@ def validate_manifest_candidate(
     expected_summary_ref = f"{skillnet_root_ref_for(seed_id)}/{idea_id}/skill_summary.json"
     if event.get("skill_summary_ref") != expected_summary_ref:
         errors.append("skill_summary_ref does not match seed_id and idea_id")
-    if not isinstance(event.get("task_id"), str) or not event["task_id"].strip():
-        errors.append("task_id must be a non-empty string")
+    expected_subject = subject_for(seed_id, idea_id)
+    if event.get("task_id") != expected_subject:
+        errors.append(f"task_id must be {expected_subject!r}")
 
-    claude_session_ref = event.get("claude_session_ref")
-    if not isinstance(claude_session_ref, str) or not claude_session_ref.strip():
-        errors.append("claude_session_ref must be a non-empty string")
-        return errors
-
-    session_path = root / claude_session_ref
-    report.checked_paths.append(str(session_path))
-    if not session_path.is_dir():
-        errors.append(f"claude_session_ref does not point to a directory: {claude_session_ref}")
-    elif not (session_path / "status.json").is_file():
-        errors.append(f"claude_session_ref is missing status.json: {claude_session_ref}")
+    errors.extend(
+        validate_claude_session_reference(
+            root,
+            event.get("claude_session_ref"),
+            expected_phase=PHASE_NAME,
+            expected_subject=expected_subject,
+            expected_outputs=[generated_task_ref_for(seed_id, idea_id)],
+            report=report,
+        )
+    )
     return errors
 
 
@@ -571,7 +573,7 @@ def build_claude_command(
     return command
 
 
-def command_run(args: argparse.Namespace) -> int:
+def _command_run_locked(args: argparse.Namespace) -> int:
     root = project_root()
     errors = ensure_phase3_inputs(root, args.seed_id, args.idea_id)
     if errors:
@@ -593,10 +595,29 @@ def command_run(args: argparse.Namespace) -> int:
     if args.dry_run:
         return 0
 
+    subject = subject_for(args.seed_id, args.idea_id)
     before_sessions = list_session_dirs(root, args.seed_id, args.idea_id)
-    exit_code = subprocess.run(command, cwd=root, check=False).returncode
+    exit_code = subprocess.run(
+        command,
+        cwd=root,
+        check=False,
+        **delegated_phase_subject_lock_kwargs(root, subject),
+    ).returncode
     if exit_code != 0:
         return exit_code
+
+    session_dir, session_errors = select_new_claude_session(
+        root,
+        expected_phase=PHASE_NAME,
+        expected_subject=subject,
+        expected_outputs=[generated_task_ref_for(args.seed_id, args.idea_id)],
+        before=before_sessions,
+    )
+    if session_dir is None:
+        print("cannot append manifest: Claude session validation failed", file=sys.stderr)
+        for error in session_errors:
+            print(f"- {error}", file=sys.stderr)
+        return 1
 
     print()
     print("validating phase3 generated task...")
@@ -605,16 +626,23 @@ def command_run(args: argparse.Namespace) -> int:
     if task_exit_code != 0:
         return task_exit_code
 
-    claude_session_ref = find_new_session_ref(root, args.seed_id, args.idea_id, before_sessions)
-    if claude_session_ref is None:
-        print("cannot append manifest: no Claude session directory was found", file=sys.stderr)
-        return 1
-
-    append_manifest_event(root, args.seed_id, args.idea_id, claude_session_ref)
+    append_manifest_event(
+        root,
+        args.seed_id,
+        args.idea_id,
+        session_ref_for(root, session_dir),
+    )
 
     print()
     print("validating phase3 manifest...")
     return print_report(validate_phase3(root, args.seed_id, args.idea_id), as_json=False)
+
+
+def command_run(args: argparse.Namespace) -> int:
+    root = project_root()
+    subject = subject_for(args.seed_id, args.idea_id)
+    with phase_subject_lock(root, PHASE_NAME, subject):
+        return _command_run_locked(args)
 
 
 def command_validate(args: argparse.Namespace) -> int:

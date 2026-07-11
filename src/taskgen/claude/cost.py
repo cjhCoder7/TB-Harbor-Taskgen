@@ -5,14 +5,17 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import sys
 import time
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
+
+from taskgen.common import fsync_parent_directory
 
 
 TOKEN_FIELDS = (
@@ -26,6 +29,9 @@ TOKEN_FIELDS = (
 
 OPENROUTER_GENERATION_ENDPOINT = "https://openrouter.ai/api/v1/generation"
 OPENROUTER_RETRY_STATUSES = {404, 408, 409, 425, 429, 500, 502, 503, 504, 524, 529}
+DEFAULT_OPENROUTER_DEADLINE_SECONDS = 30.0
+DEFAULT_OPENROUTER_MAX_GENERATIONS = 100
+DEFAULT_OPENROUTER_QUERY_TIMEOUT_SECONDS = 10.0
 OPENROUTER_TOTAL_FIELDS = (
     "tokens_prompt",
     "tokens_completion",
@@ -68,9 +74,18 @@ class OpenRouterQueryError(Exception):
 def number_or_none(value: Any) -> int | float | None:
     if isinstance(value, bool):
         return None
-    if isinstance(value, int | float):
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float) and math.isfinite(value):
         return value
     return None
+
+
+def nonnegative_number_or_none(value: Any) -> int | float | None:
+    number = number_or_none(value)
+    if number is None or number < 0:
+        return None
+    return number
 
 
 def dict_or_none(value: Any) -> dict[str, Any] | None:
@@ -81,25 +96,37 @@ def string_or_none(value: Any) -> str | None:
     return value if isinstance(value, str) and value else None
 
 
+def iter_json_events(path: Path) -> Iterator[tuple[dict[str, Any] | None, bool]]:
+    """Yield parsed object events without loading the entire stream log."""
+    if not path.exists():
+        return
+
+    with path.open("r", encoding="utf-8", errors="replace") as handle:
+        for raw_line in handle:
+            line = raw_line.strip()
+            if not line.startswith("{"):
+                yield None, False
+                continue
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                yield None, True
+                continue
+            yield event if isinstance(event, dict) else None, False
+
+
 def read_json_events(path: Path) -> tuple[list[dict[str, Any]], int, int]:
+    """Compatibility helper; stream consumers should prefer ``iter_json_events``."""
     events: list[dict[str, Any]] = []
     line_count = 0
     invalid_json_line_count = 0
 
-    if not path.exists():
-        return events, line_count, invalid_json_line_count
-
-    for raw_line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+    for event, invalid_json in iter_json_events(path):
         line_count += 1
-        line = raw_line.strip()
-        if not line.startswith("{"):
-            continue
-        try:
-            event = json.loads(line)
-        except json.JSONDecodeError:
+        if invalid_json:
             invalid_json_line_count += 1
             continue
-        if isinstance(event, dict):
+        if event is not None:
             events.append(event)
 
     return events, line_count, invalid_json_line_count
@@ -167,15 +194,30 @@ def merge_token_totals(total: dict[str, int | float], usage: dict[str, Any]) -> 
 
 
 def parse_claude_stream_log(stream_log: Path) -> dict[str, Any]:
-    events, line_count, invalid_json_line_count = read_json_events(stream_log)
-    openrouter_generation_ids = find_openrouter_generation_ids(events)
-
     init_event: dict[str, Any] | None = None
     result_event: dict[str, Any] | None = None
     assistant_usage_by_message: dict[str, dict[str, Any]] = {}
-    anonymous_usage: list[dict[str, Any]] = []
+    anonymous_usage_totals: dict[str, int | float] = {}
+    anonymous_usage_count = 0
+    openrouter_generation_ids: list[str] = []
+    seen_generation_ids: set[str] = set()
+    line_count = 0
+    json_event_count = 0
+    invalid_json_line_count = 0
 
-    for event in events:
+    for event, invalid_json in iter_json_events(stream_log):
+        line_count += 1
+        if invalid_json:
+            invalid_json_line_count += 1
+        if event is None:
+            continue
+        json_event_count += 1
+
+        generation_id = event_generation_id(event)
+        if generation_id and generation_id not in seen_generation_ids:
+            seen_generation_ids.add(generation_id)
+            openrouter_generation_ids.append(generation_id)
+
         if event.get("type") == "system" and event.get("subtype") == "init":
             init_event = event
         if event.get("type") == "result":
@@ -191,13 +233,14 @@ def parse_claude_stream_log(stream_log: Path) -> dict[str, Any]:
                 "usage": usage,
             }
         else:
-            anonymous_usage.append({"model": model, "usage": usage})
+            merge_token_totals(anonymous_usage_totals, usage)
+            anonymous_usage_count += 1
 
     assistant_usage_totals: dict[str, int | float] = {}
     for item in assistant_usage_by_message.values():
         merge_token_totals(assistant_usage_totals, item["usage"])
-    for item in anonymous_usage:
-        merge_token_totals(assistant_usage_totals, item["usage"])
+    for key, value in anonymous_usage_totals.items():
+        assistant_usage_totals[key] = assistant_usage_totals.get(key, 0) + value
 
     result_usage = dict_or_none(result_event.get("usage")) if result_event else None
     provider_usage_cost = number_or_none(result_usage.get("cost")) if result_usage else None
@@ -224,7 +267,7 @@ def parse_claude_stream_log(stream_log: Path) -> dict[str, Any]:
         "stream_log": str(stream_log),
         "parsed": stream_log.exists(),
         "line_count": line_count,
-        "json_event_count": len(events),
+        "json_event_count": json_event_count,
         "invalid_json_line_count": invalid_json_line_count,
         "session_id": session_id,
         "model": model,
@@ -238,7 +281,7 @@ def parse_claude_stream_log(stream_log: Path) -> dict[str, Any]:
         "usage": result_usage,
         "model_usage": result_model_usage,
         "assistant_usage_totals": assistant_usage_totals or None,
-        "assistant_message_count": len(assistant_usage_by_message) + len(anonymous_usage),
+        "assistant_message_count": len(assistant_usage_by_message) + anonymous_usage_count,
         "cost_source": "claude_stream_log" if total_cost_usd is not None else None,
         "claude_stream_total_cost_usd": total_cost_usd,
         "openrouter_generation_ids": openrouter_generation_ids,
@@ -277,6 +320,8 @@ def read_float_env(name: str, default: float, minimum: float, maximum: float) ->
     try:
         value = float(raw_value)
     except ValueError:
+        return default
+    if not math.isfinite(value):
         return default
     return min(max(value, minimum), maximum)
 
@@ -341,6 +386,8 @@ def query_openrouter_generation(
         raise OpenRouterQueryError(f"OpenRouter generation query failed: {error.reason}") from error
     except TimeoutError as error:
         raise OpenRouterQueryError("OpenRouter generation query timed out") from error
+    except OSError as error:
+        raise OpenRouterQueryError(f"OpenRouter generation query failed: {error}") from error
 
     try:
         payload = json.loads(response_body.decode("utf-8"))
@@ -359,7 +406,10 @@ def compact_openrouter_generation(data: dict[str, Any]) -> dict[str, Any]:
 
 def merge_numeric_totals(total: dict[str, int | float], data: dict[str, Any], fields: tuple[str, ...]) -> None:
     for field in fields:
-        value = number_or_none(data.get(field))
+        if field == "total_cost":
+            value = nonnegative_number_or_none(data.get(field))
+        else:
+            value = number_or_none(data.get(field))
         if value is None:
             continue
         total[field] = total.get(field, 0) + value
@@ -384,29 +434,95 @@ def fetch_openrouter_generation_stats(
     fetch_generation: Callable[[str, str], dict[str, Any]] | None = None,
     retry_count: int | None = None,
     retry_delay_seconds: float | None = None,
+    deadline_seconds: float | None = None,
+    max_generation_count: int | None = None,
+    query_timeout_seconds: float | None = None,
 ) -> dict[str, Any]:
-    fetch = fetch_generation or query_openrouter_generation
     retries = retry_count if retry_count is not None else read_int_env("TASKGEN_OPENROUTER_RETRIES", 1, 0, 5)
+    retries = min(max(retries, 0), 5)
     retry_delay = (
         retry_delay_seconds
         if retry_delay_seconds is not None
         else read_float_env("TASKGEN_OPENROUTER_RETRY_DELAY_SECONDS", 1.0, 0.0, 10.0)
     )
+    if not math.isfinite(retry_delay) or retry_delay < 0:
+        retry_delay = 1.0
+    retry_delay = min(retry_delay, 10.0)
+    deadline_budget = (
+        deadline_seconds
+        if deadline_seconds is not None
+        else read_float_env(
+            "TASKGEN_OPENROUTER_DEADLINE_SECONDS",
+            DEFAULT_OPENROUTER_DEADLINE_SECONDS,
+            0.1,
+            120.0,
+        )
+    )
+    if not math.isfinite(deadline_budget) or deadline_budget <= 0:
+        deadline_budget = DEFAULT_OPENROUTER_DEADLINE_SECONDS
+    deadline_budget = min(deadline_budget, 120.0)
+    generation_limit = (
+        max_generation_count
+        if max_generation_count is not None
+        else read_int_env(
+            "TASKGEN_OPENROUTER_MAX_GENERATIONS",
+            DEFAULT_OPENROUTER_MAX_GENERATIONS,
+            1,
+            1000,
+        )
+    )
+    generation_limit = min(max(generation_limit, 1), 1000)
+    query_timeout = (
+        query_timeout_seconds
+        if query_timeout_seconds is not None
+        else read_float_env(
+            "TASKGEN_OPENROUTER_QUERY_TIMEOUT_SECONDS",
+            DEFAULT_OPENROUTER_QUERY_TIMEOUT_SECONDS,
+            0.1,
+            30.0,
+        )
+    )
+    if not math.isfinite(query_timeout) or query_timeout <= 0:
+        query_timeout = DEFAULT_OPENROUTER_QUERY_TIMEOUT_SECONDS
+    query_timeout = min(query_timeout, 30.0)
 
     generations: list[dict[str, Any]] = []
     failures: list[dict[str, Any]] = []
     totals: dict[str, int | float] = {}
     by_model: dict[str, dict[str, Any]] = {}
     by_provider: dict[str, dict[str, Any]] = {}
+    valid_generation_cost_count = 0
+    queried_generation_count = 0
+    deadline_exceeded = False
+    deadline = time.monotonic() + deadline_budget
+    selected_generation_ids = generation_ids[:generation_limit]
 
-    for generation_id in generation_ids:
+    for generation_id in selected_generation_ids:
+        if time.monotonic() >= deadline:
+            deadline_exceeded = True
+            break
         last_error: OpenRouterQueryError | None = None
         for attempt in range(retries + 1):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                deadline_exceeded = True
+                break
+            if attempt == 0:
+                queried_generation_count += 1
             try:
-                data = fetch(generation_id, api_key)
+                if fetch_generation is None:
+                    data = query_openrouter_generation(
+                        generation_id,
+                        api_key,
+                        timeout=max(0.001, min(query_timeout, remaining)),
+                    )
+                else:
+                    data = fetch_generation(generation_id, api_key)
                 compact = compact_openrouter_generation(data)
                 compact.setdefault("id", generation_id)
                 generations.append(compact)
+                if nonnegative_number_or_none(compact.get("total_cost")) is not None:
+                    valid_generation_cost_count += 1
                 merge_numeric_totals(totals, compact, OPENROUTER_TOTAL_FIELDS)
                 increment_group(by_model, string_or_none(compact.get("model")), compact)
                 increment_group(by_provider, string_or_none(compact.get("provider_name")), compact)
@@ -418,7 +534,11 @@ def fetch_openrouter_generation_stats(
                 if not retryable or attempt >= retries:
                     break
                 if retry_delay:
-                    time.sleep(retry_delay)
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        deadline_exceeded = True
+                        break
+                    time.sleep(min(retry_delay, remaining))
         if last_error is not None:
             failure: dict[str, Any] = {
                 "id": generation_id,
@@ -427,13 +547,34 @@ def fetch_openrouter_generation_stats(
             if last_error.status is not None:
                 failure["status"] = last_error.status
             failures.append(failure)
+        if deadline_exceeded:
+            break
+
+    processed_generation_count = len(generations) + len(failures)
+    unqueried_generation_count = len(generation_ids) - processed_generation_count
+    truncated = len(generation_ids) > len(selected_generation_ids)
+    complete = (
+        not deadline_exceeded
+        and not truncated
+        and not failures
+        and len(generations) == len(generation_ids)
+    )
+    cost_complete = complete and valid_generation_cost_count == len(generation_ids)
 
     return {
         "queried": True,
         "generation_count": len(generation_ids),
+        "queried_generation_count": queried_generation_count,
         "successful_generation_count": len(generations),
         "failed_generation_count": len(failures),
-        "complete": len(failures) == 0 and len(generations) == len(generation_ids),
+        "unqueried_generation_count": unqueried_generation_count,
+        "complete": complete,
+        "cost_complete": cost_complete,
+        "valid_generation_cost_count": valid_generation_cost_count,
+        "deadline_exceeded": deadline_exceeded,
+        "deadline_seconds": deadline_budget,
+        "truncated": truncated,
+        "max_generation_count": generation_limit,
         "total_cost": totals.get("total_cost"),
         "usage": totals.get("usage"),
         "totals": totals,
@@ -471,17 +612,26 @@ def enrich_with_openrouter_generation_stats(
         }
         return summary
 
-    openrouter_summary = fetch_openrouter_generation_stats(
-        generation_ids,
-        resolved_api_key,
-        fetch_generation=fetch_generation,
-    )
+    try:
+        openrouter_summary = fetch_openrouter_generation_stats(
+            generation_ids,
+            resolved_api_key,
+            fetch_generation=fetch_generation,
+        )
+    except Exception as exc:
+        summary["openrouter"] = {
+            "queried": False,
+            "reason": "query_error",
+            "generation_count": len(generation_ids),
+            "error": str(exc)[:500],
+        }
+        return summary
     summary["openrouter"] = openrouter_summary
 
-    total_cost = number_or_none(openrouter_summary.get("total_cost"))
+    total_cost = nonnegative_number_or_none(openrouter_summary.get("total_cost"))
     if total_cost is not None:
         summary["openrouter_total_cost_usd"] = total_cost
-    if openrouter_summary.get("complete") and total_cost is not None:
+    if openrouter_summary.get("cost_complete") and total_cost is not None:
         summary["total_cost_usd"] = total_cost
         summary["cost_source"] = "openrouter_generation_api"
     return summary
@@ -532,7 +682,20 @@ def format_cost_summary(summary: dict[str, Any]) -> str:
 
 def write_cost_summary(summary: dict[str, Any], output_path: Path) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_text(json.dumps(summary, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    temporary = output_path.parent / f".{output_path.name}.tmp-{os.getpid()}-{time.time_ns()}"
+    try:
+        with temporary.open("w", encoding="utf-8") as handle:
+            json.dump(summary, handle, indent=2, ensure_ascii=False)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, output_path)
+        fsync_parent_directory(output_path)
+    finally:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 def command_summarize(args: argparse.Namespace) -> int:

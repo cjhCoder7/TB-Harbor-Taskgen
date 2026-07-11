@@ -15,7 +15,6 @@ successfully.
 from __future__ import annotations
 
 import argparse
-import json
 import re
 import subprocess
 import sys
@@ -24,13 +23,21 @@ from typing import Any
 
 from taskgen.common import (
     ValidationReport,
+    append_jsonl_object,
+    delegated_phase_subject_lock_kwargs,
     load_json,
+    phase_subject_lock,
     print_report,
     project_root,
+    read_jsonl_objects,
+    require_no_template_markers,
     require_object,
     require_string,
     require_string_list,
-    validate_path_segment,
+    select_new_claude_session,
+    validate_claude_session_reference,
+    validate_idea_identifier,
+    validate_seed_identifier,
 )
 from taskgen.config import (
     EFFORT_LEVELS,
@@ -56,11 +63,24 @@ def positive_int_arg(value: str) -> int:
 
 
 def validate_seed_id(seed_id: str) -> list[str]:
-    return validate_path_segment(seed_id, "seed_id")
+    return validate_seed_identifier(seed_id)
 
 
 def seed_path_for(root: Path, seed_id: str) -> Path:
     return (root / "seeds" / seed_id).resolve()
+
+
+def seed_path_containment_error(root: Path, seed_id: str) -> str | None:
+    try:
+        seed_path = seed_path_for(root, seed_id)
+        seeds_root = (root / "seeds").resolve()
+    except (OSError, RuntimeError) as exc:
+        return f"cannot resolve seed path safely: {exc}"
+    try:
+        seed_path.relative_to(seeds_root)
+    except ValueError:
+        return f"seed path must stay under {seeds_root}: {seed_path}"
+    return None
 
 
 def brainstorm_ref_for(seed_id: str) -> str:
@@ -87,17 +107,18 @@ def session_ref_for(root: Path, session_dir: Path) -> str:
 
 
 def find_new_session_ref(root: Path, seed_id: str, before: set[Path]) -> str | None:
-    created = list(list_session_dirs(root, seed_id) - before)
-    if not created:
-        return None
-
-    created.sort(key=lambda path: path.stat().st_mtime_ns, reverse=True)
-    return session_ref_for(root, created[0])
+    session_dir, _ = select_new_claude_session(
+        root,
+        expected_phase=PHASE_NAME,
+        expected_subject=seed_id,
+        expected_outputs=[brainstorm_ref_for(seed_id)],
+        before=before,
+    )
+    return session_ref_for(root, session_dir) if session_dir is not None else None
 
 
 def append_manifest_event(root: Path, seed_id: str, claude_session_ref: str) -> None:
     manifest_path = root / "runs/task-manifest.jsonl"
-    manifest_path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "event": "brainstormed",
         "seed_id": seed_id,
@@ -106,8 +127,7 @@ def append_manifest_event(root: Path, seed_id: str, claude_session_ref: str) -> 
         "status": "working",
         "reason": "phase 1 brainstorm completed",
     }
-    with manifest_path.open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n")
+    append_jsonl_object(manifest_path, payload)
 
 
 def ensure_seed_layout(root: Path, seed_id: str, errors: list[str]) -> None:
@@ -130,6 +150,10 @@ def ensure_phase1_inputs(root: Path, seed_id: str) -> list[str]:
     errors = validate_seed_id(seed_id)
     if errors:
         return errors
+
+    containment_error = seed_path_containment_error(root, seed_id)
+    if containment_error:
+        return [containment_error]
 
     ensure_seed_layout(root, seed_id, errors)
     for required in (
@@ -164,6 +188,7 @@ def render_phase1_prompt(root: Path, seed_id: str, idea_count: int | None = None
     prompt = prompt.replace("{{SEED_ID}}", seed_id)
     prompt = prompt.replace("{{SEED_PATH}}", workspace_seed_ref_for(seed_id))
     prompt = prompt.replace("{{IDEA_COUNT_REQUIREMENT}}", idea_count_requirement(idea_count))
+    require_no_template_markers(prompt, "phase1 prompt")
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(prompt, encoding="utf-8")
     return output_path
@@ -178,15 +203,7 @@ def validate_manifest_event(root: Path, seed_id: str, brainstorm_ref: str, repor
 
     found = False
     candidate_errors: list[str] = []
-    for line_number, line in enumerate(manifest_path.read_text(encoding="utf-8").splitlines(), start=1):
-        if not line.strip():
-            continue
-        try:
-            event = json.loads(line)
-        except json.JSONDecodeError as exc:
-            report.errors.append(f"invalid JSONL at {manifest_path}:{line_number}: {exc}")
-            continue
-
+    for line_number, event in read_jsonl_objects(manifest_path, report):
         if not (
             event.get("event") == "brainstormed"
             and event.get("seed_id") == seed_id
@@ -216,17 +233,16 @@ def validate_manifest_candidate(root: Path, event: dict[str, Any], report: Valid
     if not isinstance(event.get("reason"), str) or not event["reason"].strip():
         errors.append("reason must be a non-empty string")
 
-    claude_session_ref = event.get("claude_session_ref")
-    if not isinstance(claude_session_ref, str) or not claude_session_ref.strip():
-        errors.append("claude_session_ref must be a non-empty string")
-        return errors
-
-    session_path = root / claude_session_ref
-    report.checked_paths.append(str(session_path))
-    if not session_path.is_dir():
-        errors.append(f"claude_session_ref does not point to a directory: {claude_session_ref}")
-    elif not (session_path / "status.json").is_file():
-        errors.append(f"claude_session_ref is missing status.json: {claude_session_ref}")
+    errors.extend(
+        validate_claude_session_reference(
+            root,
+            event.get("claude_session_ref"),
+            expected_phase=PHASE_NAME,
+            expected_subject=str(event.get("seed_id")),
+            expected_outputs=[brainstorm_ref_for(str(event.get("seed_id")))],
+            report=report,
+        )
+    )
     return errors
 
 
@@ -310,6 +326,7 @@ def validate_idea(
         seen_idea_ids.add(idea_id)
         if not IDEA_ID_RE.fullmatch(idea_id):
             report.errors.append(f"{idea_path}.idea_id must be path-friendly: {idea_id!r}")
+        report.errors.extend(validate_idea_identifier(idea_id))
 
     for key in ("title", "scenario", "core_transfer", "verifier_sketch"):
         require_string(idea, key, idea_path, report)
@@ -364,6 +381,11 @@ def validate_phase1(
         report.errors.extend(seed_errors)
         return report
 
+    containment_error = seed_path_containment_error(root, seed_id)
+    if containment_error:
+        report.errors.append(containment_error)
+        return report
+
     validate_seed_layout(root, seed_id, report)
 
     brainstorm_ref = brainstorm_ref_for(seed_id)
@@ -400,7 +422,7 @@ def build_claude_command(
     return command
 
 
-def command_run(args: argparse.Namespace) -> int:
+def _command_run_locked(args: argparse.Namespace) -> int:
     root = project_root()
     errors = ensure_phase1_inputs(root, args.seed_id)
     if errors:
@@ -420,9 +442,27 @@ def command_run(args: argparse.Namespace) -> int:
         return 0
 
     before_sessions = list_session_dirs(root, args.seed_id)
-    exit_code = subprocess.run(command, cwd=root, check=False).returncode
+    exit_code = subprocess.run(
+        command,
+        cwd=root,
+        check=False,
+        **delegated_phase_subject_lock_kwargs(root, args.seed_id),
+    ).returncode
     if exit_code != 0:
         return exit_code
+
+    session_dir, session_errors = select_new_claude_session(
+        root,
+        expected_phase=PHASE_NAME,
+        expected_subject=args.seed_id,
+        expected_outputs=[brainstorm_ref_for(args.seed_id)],
+        before=before_sessions,
+    )
+    if session_dir is None:
+        print("cannot append manifest: Claude session validation failed", file=sys.stderr)
+        for error in session_errors:
+            print(f"- {error}", file=sys.stderr)
+        return 1
 
     print()
     print("validating phase1 brainstorm output...")
@@ -436,12 +476,7 @@ def command_run(args: argparse.Namespace) -> int:
     if brainstorm_exit_code != 0:
         return brainstorm_exit_code
 
-    claude_session_ref = find_new_session_ref(root, args.seed_id, before_sessions)
-    if claude_session_ref is None:
-        print("cannot append manifest: no Claude session directory was found", file=sys.stderr)
-        return 1
-
-    append_manifest_event(root, args.seed_id, claude_session_ref)
+    append_manifest_event(root, args.seed_id, session_ref_for(root, session_dir))
 
     print()
     print("validating phase1 manifest...")
@@ -449,6 +484,12 @@ def command_run(args: argparse.Namespace) -> int:
         validate_phase1(root, args.seed_id, expected_idea_count=args.idea_count),
         as_json=False,
     )
+
+
+def command_run(args: argparse.Namespace) -> int:
+    root = project_root()
+    with phase_subject_lock(root, PHASE_NAME, args.seed_id):
+        return _command_run_locked(args)
 
 
 def command_validate(args: argparse.Namespace) -> int:

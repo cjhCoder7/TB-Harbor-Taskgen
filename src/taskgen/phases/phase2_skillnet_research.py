@@ -14,21 +14,30 @@ index plus one curated skill package set per idea:
 from __future__ import annotations
 
 import argparse
-import json
 import subprocess
 import sys
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 from taskgen.common import (
     ValidationReport,
+    append_jsonl_object,
+    delegated_phase_subject_lock_kwargs,
     load_json,
+    phase_subject_lock,
     print_report,
     project_root,
+    read_jsonl_objects,
+    require_no_template_markers,
     require_object,
     require_string,
     require_string_list,
+    select_new_claude_session,
+    validate_claude_session_reference,
+    validate_idea_identifier,
     validate_path_segment,
+    validate_seed_identifier,
 )
 from taskgen.config import (
     EFFORT_LEVELS,
@@ -49,7 +58,7 @@ STATUS_VALUES = {"ready", "partial", "no_strong_match", "failed"}
 
 
 def validate_seed_id(seed_id: str) -> list[str]:
-    return validate_path_segment(seed_id, "seed_id")
+    return validate_seed_identifier(seed_id)
 
 
 def workspace_brainstorm_ref_for(seed_id: str) -> str:
@@ -92,17 +101,18 @@ def session_ref_for(root: Path, session_dir: Path) -> str:
 
 
 def find_new_session_ref(root: Path, seed_id: str, before: set[Path]) -> str | None:
-    created = list(list_session_dirs(root, seed_id) - before)
-    if not created:
-        return None
-
-    created.sort(key=lambda path: path.stat().st_mtime_ns, reverse=True)
-    return session_ref_for(root, created[0])
+    session_dir, _ = select_new_claude_session(
+        root,
+        expected_phase=PHASE_NAME,
+        expected_subject=seed_id,
+        expected_outputs=[skillnet_root_ref_for(seed_id)],
+        before=before,
+    )
+    return session_ref_for(root, session_dir) if session_dir is not None else None
 
 
 def append_manifest_event(root: Path, seed_id: str, claude_session_ref: str) -> None:
     manifest_path = root / "runs/task-manifest.jsonl"
-    manifest_path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "event": "skillnet_done",
         "seed_id": seed_id,
@@ -112,8 +122,7 @@ def append_manifest_event(root: Path, seed_id: str, claude_session_ref: str) -> 
         "status": "working",
         "reason": "phase 2 SkillNet research completed",
     }
-    with manifest_path.open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n")
+    append_jsonl_object(manifest_path, payload)
 
 
 def ensure_phase2_inputs(root: Path, seed_id: str) -> list[str]:
@@ -142,6 +151,7 @@ def render_phase2_prompt(root: Path, seed_id: str) -> Path:
     prompt = prompt.replace("{{BRAINSTORM_PATH}}", workspace_brainstorm_ref_for(seed_id))
     prompt = prompt.replace("{{OUTPUT_PATH}}", "output/skillnet")
     prompt = prompt.replace("{{SKILLNET_INDEX_REF}}", workspace_skillnet_index_ref_for(seed_id))
+    require_no_template_markers(prompt, "phase2 prompt")
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(prompt, encoding="utf-8")
     return output_path
@@ -149,10 +159,24 @@ def render_phase2_prompt(root: Path, seed_id: str) -> Path:
 
 def require_int(obj: dict[str, Any], key: str, path: str, report: ValidationReport) -> int | None:
     value = obj.get(key)
-    if not isinstance(value, int):
+    if not isinstance(value, int) or isinstance(value, bool):
         report.errors.append(f"{path}.{key} must be an integer")
         return None
     return value
+
+
+def validate_iso8601_timestamp(value: str, path: str, report: ValidationReport) -> None:
+    if "T" not in value:
+        report.errors.append(f"{path} must be an ISO-8601 date-time with a timezone")
+        return
+    normalized = value[:-1] + "+00:00" if value.endswith(("Z", "z")) else value
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError:
+        report.errors.append(f"{path} must be a valid ISO-8601 date-time")
+        return
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        report.errors.append(f"{path} must include an ISO-8601 timezone offset")
 
 
 def require_status(obj: dict[str, Any], path: str, report: ValidationReport) -> str | None:
@@ -191,7 +215,7 @@ def load_brainstorm_ideas(root: Path, seed_id: str, report: ValidationReport) ->
         idea_id = idea_value.get("idea_id")
         title = idea_value.get("title")
         if isinstance(idea_id, str) and idea_id.strip() and isinstance(title, str) and title.strip():
-            idea_id_errors = validate_path_segment(idea_id, f"$.brainstorm.ideas[{index}].idea_id")
+            idea_id_errors = validate_idea_identifier(idea_id)
             if idea_id_errors:
                 report.errors.extend(idea_id_errors)
                 continue
@@ -215,11 +239,11 @@ def validate_index_entry(
     require_string_list(entry, "notes", path, report)
 
     if idea_id is not None:
-        report.errors.extend(validate_path_segment(idea_id, f"{path}.idea_id"))
+        report.errors.extend(validate_idea_identifier(idea_id))
         if idea_id not in idea_titles:
             report.errors.append(f"{path}.idea_id is not present in phase1 brainstorm: {idea_id!r}")
         if title is not None and idea_titles.get(idea_id) and title != idea_titles[idea_id]:
-            report.warnings.append(f"{path}.title differs from phase1 brainstorm title")
+            report.errors.append(f"{path}.title must exactly match the phase1 brainstorm title")
         expected_ref = workspace_skill_summary_ref_for(seed_id, idea_id)
         if skill_summary_ref is not None and skill_summary_ref != expected_ref:
             report.errors.append(f"{path}.skill_summary_ref must be {expected_ref!r}")
@@ -265,11 +289,18 @@ def validate_skill_package_frontmatter(
     report: ValidationReport,
 ) -> None:
     report.checked_paths.append(str(skill_file))
+    if skill_file.is_symlink():
+        report.errors.append(f"skill package SKILL.md must not be a symlink: {skill_file}")
+        return
     if not skill_file.is_file():
         report.errors.append(f"missing skill package SKILL.md: {skill_file}")
         return
 
-    lines = skill_file.read_text(encoding="utf-8").splitlines()
+    try:
+        lines = skill_file.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeError) as exc:
+        report.errors.append(f"cannot read skill package file {skill_file}: {exc}")
+        return
     if not lines or lines[0].strip() != "---":
         report.errors.append(f"{skill_file} must start with YAML frontmatter")
         return
@@ -331,7 +362,14 @@ def validate_selected_skill(
     report.checked_paths.append(str(package_dir))
     if not package_dir.is_dir():
         report.errors.append(f"missing selected skill package directory: {package_dir}")
+    elif package_dir.is_symlink():
+        report.errors.append(f"selected skill package must not be a symlink: {package_dir}")
     else:
+        for package_path in sorted(package_dir.rglob("*")):
+            if package_path.is_symlink():
+                report.errors.append(
+                    f"selected skill package must not contain symlinks: {package_path}"
+                )
         validate_skill_package_frontmatter(package_dir / "SKILL.md", name, report)
     return name
 
@@ -357,7 +395,7 @@ def validate_skill_summary(
         report.errors.append(f"$.summary.idea_id must equal {idea_id!r}")
     title = require_string(summary, "title", "$.summary", report)
     if title is not None and title != expected_title:
-        report.warnings.append(f"$.summary.title differs from phase1 brainstorm title for {idea_id!r}")
+        report.errors.append(f"$.summary.title must exactly match the phase1 brainstorm title for {idea_id!r}")
     status = require_status(summary, "$.summary", report)
 
     selected = summary.get("selected_skills")
@@ -447,7 +485,9 @@ def validate_skillnet_index(
     if brainstorm_ref is not None and brainstorm_ref != expected_brainstorm_ref:
         report.errors.append(f"$.index.brainstorm_ref must be {expected_brainstorm_ref!r}")
 
-    require_string(index, "generated_at", "$.index", report)
+    generated_at = require_string(index, "generated_at", "$.index", report)
+    if generated_at is not None:
+        validate_iso8601_timestamp(generated_at, "$.index.generated_at", report)
     ideas = index.get("ideas")
     if not isinstance(ideas, list):
         report.errors.append("$.index.ideas must be a list")
@@ -484,15 +524,7 @@ def validate_manifest_event(root: Path, seed_id: str, skillnet_ref: str, report:
 
     found = False
     candidate_errors: list[str] = []
-    for line_number, line in enumerate(manifest_path.read_text(encoding="utf-8").splitlines(), start=1):
-        if not line.strip():
-            continue
-        try:
-            event = json.loads(line)
-        except json.JSONDecodeError as exc:
-            report.errors.append(f"invalid JSONL at {manifest_path}:{line_number}: {exc}")
-            continue
-
+    for line_number, event in read_jsonl_objects(manifest_path, report):
         if not (
             event.get("event") == "skillnet_done"
             and event.get("seed_id") == seed_id
@@ -524,17 +556,17 @@ def validate_manifest_candidate(root: Path, event: dict[str, Any], report: Valid
     if event.get("brainstorm_ref") != brainstorm_ref_for(str(event.get("seed_id"))):
         errors.append("brainstorm_ref does not match seed_id")
 
-    claude_session_ref = event.get("claude_session_ref")
-    if not isinstance(claude_session_ref, str) or not claude_session_ref.strip():
-        errors.append("claude_session_ref must be a non-empty string")
-        return errors
-
-    session_path = root / claude_session_ref
-    report.checked_paths.append(str(session_path))
-    if not session_path.is_dir():
-        errors.append(f"claude_session_ref does not point to a directory: {claude_session_ref}")
-    elif not (session_path / "status.json").is_file():
-        errors.append(f"claude_session_ref is missing status.json: {claude_session_ref}")
+    seed_id = str(event.get("seed_id"))
+    errors.extend(
+        validate_claude_session_reference(
+            root,
+            event.get("claude_session_ref"),
+            expected_phase=PHASE_NAME,
+            expected_subject=seed_id,
+            expected_outputs=[skillnet_root_ref_for(seed_id)],
+            report=report,
+        )
+    )
     return errors
 
 
@@ -586,7 +618,7 @@ def build_claude_command(
     return command
 
 
-def command_run(args: argparse.Namespace) -> int:
+def _command_run_locked(args: argparse.Namespace) -> int:
     root = project_root()
     errors = ensure_phase2_inputs(root, args.seed_id)
     if errors:
@@ -606,9 +638,27 @@ def command_run(args: argparse.Namespace) -> int:
         return 0
 
     before_sessions = list_session_dirs(root, args.seed_id)
-    exit_code = subprocess.run(command, cwd=root, check=False).returncode
+    exit_code = subprocess.run(
+        command,
+        cwd=root,
+        check=False,
+        **delegated_phase_subject_lock_kwargs(root, args.seed_id),
+    ).returncode
     if exit_code != 0:
         return exit_code
+
+    session_dir, session_errors = select_new_claude_session(
+        root,
+        expected_phase=PHASE_NAME,
+        expected_subject=args.seed_id,
+        expected_outputs=[skillnet_root_ref_for(args.seed_id)],
+        before=before_sessions,
+    )
+    if session_dir is None:
+        print("cannot append manifest: Claude session validation failed", file=sys.stderr)
+        for error in session_errors:
+            print(f"- {error}", file=sys.stderr)
+        return 1
 
     print()
     print("validating phase2 SkillNet output...")
@@ -617,16 +667,17 @@ def command_run(args: argparse.Namespace) -> int:
     if skillnet_exit_code != 0:
         return skillnet_exit_code
 
-    claude_session_ref = find_new_session_ref(root, args.seed_id, before_sessions)
-    if claude_session_ref is None:
-        print("cannot append manifest: no Claude session directory was found", file=sys.stderr)
-        return 1
-
-    append_manifest_event(root, args.seed_id, claude_session_ref)
+    append_manifest_event(root, args.seed_id, session_ref_for(root, session_dir))
 
     print()
     print("validating phase2 manifest...")
     return print_report(validate_phase2(root, args.seed_id), as_json=False)
+
+
+def command_run(args: argparse.Namespace) -> int:
+    root = project_root()
+    with phase_subject_lock(root, PHASE_NAME, args.seed_id):
+        return _command_run_locked(args)
 
 
 def command_validate(args: argparse.Namespace) -> int:

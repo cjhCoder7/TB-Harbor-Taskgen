@@ -52,7 +52,9 @@ work; deterministic phases run in Python and Harbor.
 [A-Za-z0-9._-]+
 ```
 
-They cannot be empty, `.`, or `..`.
+They cannot be empty, `.`, `..`, or contain the reserved `__` separator.
+`seed_id` is limited to 128 characters and `idea_id` to 120 characters, keeping
+the combined task id below the filesystem's single-component limit.
 
 The stable task id used by phase4 onward is:
 
@@ -67,14 +69,15 @@ task directories, and manifest events.
 
 ### `model.json`
 
-`model.json` configures the Claude binary, per-run timeout, default model,
-default effort, and per-phase effort levels:
+`model.json` configures the Claude binary, Claude and Harbor supervisor
+timeouts, default model, default effort, and per-phase effort levels:
 
 ```json
 {
   "claude_code_path": "cc-binary/claude-2.1.169-linux-x64",
   "claude_code_timeout_sec": 1800,
-  "default_model": "anthropic/claude-opus-4.8",
+  "harbor_check_timeout_sec": 10800,
+  "default_model": "claude-opus-4-8",
   "default_effort": "max",
   "phase_efforts": {
     "phase1": "max",
@@ -99,6 +102,12 @@ this limit, the runner terminates its isolated process group and records exit
 code `124` with `timed_out: true`. Process-group cleanup is a POSIX/Linux
 runtime behavior.
 
+`harbor_check_timeout_sec` is the positive, finite supervisor timeout for each
+oracle or nop Harbor invocation. The default is `10800` seconds. A timed-out
+check records exit code `124` and timeout metadata in the reviewable phase4
+status. Unknown top-level `model.json` fields are rejected so configuration
+typos cannot silently fall back to defaults.
+
 `phase_efforts` accepts canonical phase keys and aliases defined in
 `src/taskgen/config.py`. Prefer canonical keys (`phase1` through `phase7`) for
 new config.
@@ -111,7 +120,7 @@ new config.
 | `scripts/run-claude-logged.sh` | Runs the Claude wrapper and records session metadata. |
 | `scripts/run-harbor-oracle-nop.sh` | Runs Harbor oracle/nop checks. |
 | `scripts/clean-intermediate.sh` | Cleans intermediate runtime artifacts. |
-| `scripts/tool_init.sh` | Installs `harbor==0.13.2` and `skillnet-ai` with `uv tool install`. |
+| `scripts/tool_init.sh` | Installs `harbor==0.13.2` and `skillnet-ai==0.0.18` with `uv tool install`. |
 
 Each shell script sources `scripts/env_init.sh` when present and sets
 `PYTHONPATH` to include `src/`. `scripts/env_init.sh` is local-only and ignored;
@@ -169,7 +178,9 @@ an exact phase1 brainstorm idea count; when existing phase1 output has a
 different count, phase1 is rerun. Existing valid phases are otherwise skipped
 unless `--force` is set. When phase5 returns `needs_modification`, the pipeline
 runs phase6 and then forces phase4 and phase5 again until the review decision is
-`ready`, `rejected`, or the repair budget is exhausted.
+`ready`, `rejected`, or the repair budget is exhausted. A dry run returns
+non-zero when phase1 would need to run and no explicit `--idea-id` is available,
+because the remaining per-idea plan cannot yet be determined.
 
 ## 6. Artifact Layout
 
@@ -224,8 +235,16 @@ runs/workspace/<phase>/<subject>/<run_id>/
 
 The workspace receives the rendered prompt, project agents, project skills, and
 phase-specific input artifacts. Claude writes outputs under `output/...`; after
-a successful Claude exit, only declared output paths are copied back to project
-runtime directories.
+a successful Claude exit, every declared output must exist. Outputs are staged
+next to their destinations and atomically switched into project runtime
+directories so a failed copy does not destroy the previous artifact. A small
+transaction journal under `runs/output-sync-transactions/` lets the next run
+restore or complete an interrupted rename sequence after an abrupt process exit.
+Mutating phase, runner, and standalone workspace commands serialize operations
+for the same subject and hold the shared activity guard used by cleanup. A phase
+passes its actual locked subject/activity descriptors only to its direct runner
+child, so the nested invocation remains serialized without deadlocking and the
+locks survive an abrupt parent exit until the runner itself finishes.
 
 Session metadata includes:
 
@@ -236,11 +255,18 @@ Session metadata includes:
 | `cost.json` | Parsed cost and token summary. |
 | `status.json` | Run status, timeout metadata, workspace paths, synced outputs, and cost summary. |
 
+Stream logs are parsed incrementally. Optional OpenRouter generation metadata
+enrichment is bounded by a 30-second total deadline, 100 generation IDs, and a
+10-second request timeout by default. These bounds can be adjusted with
+`TASKGEN_OPENROUTER_DEADLINE_SECONDS`, `TASKGEN_OPENROUTER_MAX_GENERATIONS`, and
+`TASKGEN_OPENROUTER_QUERY_TIMEOUT_SECONDS`. Provider cost replaces the stream
+cost only when every generation has a finite, non-negative cost.
+
 Claude runs with `--verbose`, `--output-format=stream-json`,
 `--permission-mode bypassPermissions`, `--print`, `CLAUDE_CONFIG_DIR` scoped to
 the run directory, and `IS_SANDBOX=1`. On POSIX/Linux, the runner starts Claude
-in an isolated process group so a configured timeout also stops its tool
-subprocesses.
+in an isolated process group so a configured timeout, interrupt, or runner-side
+failure also stops its tool subprocesses.
 
 ## 8. Phase Contracts
 
@@ -358,8 +384,10 @@ The formal pass condition is:
 - oracle exit code is `0` and reward is `1.0`.
 - nop exit code is `0` and reward is `0.0`.
 
-The phase runner records status even when rewards fail. Pipeline review can use
-a failed but well-formed status to produce repair instructions.
+The phase runner records status even when rewards fail or a Harbor supervisor
+timeout occurs. Status and manifest data include the checked task-tree digest
+and run id, so editing the task invalidates stale check results. Pipeline review
+can use a failed but well-formed status to produce repair instructions.
 
 Manifest event: `checked`.
 
@@ -392,6 +420,9 @@ Allowed decisions are `ready`, `needs_modification`, and `rejected`.
 - `needs_modification`: non-empty `modification_items`, no blocking reasons.
 - `rejected`: non-empty `blocking_reasons`, no modification items.
 
+`review.md` must state the same decision as `review.json` and include non-empty
+Summary, Modification Items, and Blocking Reasons sections.
+
 Manifest event: `reviewed`.
 
 ### Phase 6: Task Repair
@@ -417,8 +448,10 @@ Manifest event: `repaired`.
 Phase7 requires:
 
 - phase5 validation passes.
-- phase4 formal pass condition is true.
 - review decision is `ready` or `rejected`.
+- for `ready`, phase4 formal pass condition is true.
+- for `rejected`, phase4 status is well formed and reviewable, but it may have
+  failed the formal pass condition.
 
 For `ready`, the working task is copied to:
 
@@ -432,9 +465,13 @@ For `rejected`, the working task is copied to:
 generated/rejected/<task_id>/
 ```
 
-The counterpart final directory is removed, and the working task directory is
-removed after finalization. Validation checks required task files in the final
-directory and ensures the working directory no longer exists.
+The final task is first copied and validated in a sibling staging directory,
+then atomically switched into place. The previous destination can be restored
+if switching or validation fails. Once the validated switch commits, phase7
+appends the manifest as a separate irreversible commit point. If that append is
+interrupted, the valid final destination is retained and rerunning phase7 adds
+the missing event. `runs/finalization-transactions/` also lets reruns finish
+backup cleanup or roll back an incomplete switch.
 
 Manifest event: `accepted` or `rejected`.
 
@@ -448,11 +485,11 @@ successful run and then validation checks that a matching event exists.
 | `brainstormed` | phase1 | `brainstorm_ref`, `claude_session_ref` |
 | `skillnet_done` | phase2 | `brainstorm_ref`, `skillnet_ref`, `claude_session_ref` |
 | `generated` | phase3 | `task_path`, `brainstorm_ref`, `skillnet_ref`, `skill_summary_ref`, `claude_session_ref` |
-| `checked` | phase4 | `task_path`, `oracle_nop_ref`, `passed` |
-| `reviewed` | phase5 | `review_ref`, `review_markdown_ref`, `oracle_nop_ref`, `decision`, `claude_session_ref` |
+| `checked` | phase4 | `task_path`, `oracle_nop_ref`, `passed`, `run_id`, `task_tree_sha256` |
+| `reviewed` | phase5 | `review_ref`, `review_markdown_ref`, `oracle_nop_ref`, `decision`, `claude_session_ref`, `phase4_run_id`, `task_tree_sha256` |
 | `repaired` | phase6 | `task_path`, `review_ref`, `oracle_nop_ref`, `claude_session_ref` |
-| `accepted` | phase7 | `task_path`, `source_task_ref`, `review_ref`, `oracle_nop_ref` |
-| `rejected` | phase7 | `task_path`, `source_task_ref`, `review_ref`, `oracle_nop_ref` |
+| `accepted` | phase7 | `task_path`, `source_task_ref`, `review_ref`, `oracle_nop_ref`, `run_id`, `task_tree_sha256` |
+| `rejected` | phase7 | `task_path`, `source_task_ref`, `review_ref`, `oracle_nop_ref`, `run_id`, `task_tree_sha256` |
 
 Manifest validation is strict enough to prove phase lineage, but it does not
 deduplicate older events. Validators look for at least one matching valid event.
@@ -464,9 +501,13 @@ Intermediate cleanup:
 ```bash
 scripts/clean-intermediate.sh
 scripts/clean-intermediate.sh --apply
+scripts/clean-intermediate.sh --apply --drop-manifest
+scripts/clean-intermediate.sh --apply --discard-transactions
 ```
 
-Without `--apply`, the command lists targets only. With `--apply`, it removes:
+Without `--apply`, the command lists targets only. With `--apply`, it refuses
+to run while an active pipeline/phase holds the activity lock or a Claude
+session marker remains, then removes:
 
 - `runs/prompts`
 - `runs/brainstorm`
@@ -474,11 +515,17 @@ Without `--apply`, the command lists targets only. With `--apply`, it removes:
 - `runs/oracle-nop-check`
 - `runs/reviews`
 - `runs/workspace`
+- `runs/output-sync-transactions`
+- `runs/finalization-transactions`
 - `runs/claude-sessions`
-- `runs/task-manifest.jsonl`
 - Python `__pycache__` under `src/`, `scripts/`, and `tests/`
 
 It then restores the `runs/` skeleton directories with `.gitkeep` files.
+The append-only `runs/task-manifest.jsonl` is preserved unless
+`--drop-manifest` is explicitly supplied. `--force-active` bypasses the active
+run guard for manual recovery and can disrupt a live run. Pending output-sync
+or finalization journals block cleanup so crash recovery remains possible;
+`--discard-transactions` is the explicit destructive override.
 
 Current ignore rules keep local credentials, runtime artifacts, generated task
 outputs, Python caches, and the local Claude binary out of git. `model.json`

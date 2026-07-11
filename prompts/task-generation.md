@@ -61,6 +61,7 @@ Boundaries:
 - Apart from the allowed output roots above, do not write other workspace paths.
 - Do not copy `.claude/`, `seed/`, `brainstorm/`, `skillnet/`, `raw/`, prompt files, or validation files into `{{OUTPUT_PATH}}/`.
 - Only perform the required task generation work and optional local validation described here.
+- Do not remove or prune host-global Docker images, containers, volumes, networks, or build cache. Host resource cleanup belongs to the pipeline operator, not the generation agent.
 
 TB3 format checklist:
 
@@ -122,4 +123,4 @@ Final consistency checks:
 - Confirm every command used by `solution/solve.sh` exists in the agent image or is installed by `solve.sh` before first use.
 - Confirm the workspace `output/` tree matches the required layout: generated task files live only under `{{OUTPUT_PATH}}/`, optional validation logs and Harbor jobs live only under `output/local-validation/`, and no nested `output/`, validation logs, Harbor jobs, prompts, temporary workspace files, cache directories, `.pyc` files, or transient `.log` files are present inside `{{OUTPUT_PATH}}/`.
 - Confirm `environment/Dockerfile`, `solution/solve.sh`, `instruction.md`, `task.toml` metadata, and verifier expectations describe the same toolchain and task behavior. If you change implementation tooling during validation, update metadata and explanations before finishing.
-- If you pulled or built temporary Docker images while debugging or validating, remove those ad-hoc images before finishing.
+- Leave any Docker resources created by Harbor validation in place for the pipeline operator to clean up safely after the run.

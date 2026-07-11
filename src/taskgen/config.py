@@ -13,6 +13,17 @@ from typing import Any
 EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
 MODEL_CONFIG_FILENAME = "model.json"
 DEFAULT_CLAUDE_CODE_TIMEOUT_SEC = 1800.0
+DEFAULT_HARBOR_CHECK_TIMEOUT_SEC = 10800.0
+MODEL_CONFIG_KEYS = frozenset(
+    {
+        "default_model",
+        "default_effort",
+        "phase_efforts",
+        "claude_code_path",
+        "claude_code_timeout_sec",
+        "harbor_check_timeout_sec",
+    }
+)
 PHASE_EFFORT_ALIASES = {
     "phase1": ("phase1", "brainstorm", "seed-brainstorm"),
     "phase2": ("phase2", "skillnet", "skillnet-research"),
@@ -36,6 +47,7 @@ class ModelConfig:
     phase_efforts: dict[str, str] = field(default_factory=dict)
     claude_code_path: str | None = None
     claude_code_timeout_sec: float = DEFAULT_CLAUDE_CODE_TIMEOUT_SEC
+    harbor_check_timeout_sec: float = DEFAULT_HARBOR_CHECK_TIMEOUT_SEC
 
 
 def load_model_config(root: Path) -> ModelConfig:
@@ -44,12 +56,26 @@ def load_model_config(root: Path) -> ModelConfig:
         return ModelConfig()
 
     try:
-        payload = json.loads(config_path.read_text(encoding="utf-8"))
+        config_text = config_path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError) as exc:
+        raise SystemExit(f"cannot read {config_path}: {exc}") from None
+
+    try:
+        payload = json.loads(config_text)
     except json.JSONDecodeError as exc:
         raise SystemExit(f"invalid JSON in {config_path}: {exc}") from None
 
     if not isinstance(payload, dict):
         raise SystemExit(f"{MODEL_CONFIG_FILENAME} must contain a JSON object")
+
+    unknown_keys = sorted(set(payload) - MODEL_CONFIG_KEYS)
+    if unknown_keys:
+        allowed = ", ".join(sorted(MODEL_CONFIG_KEYS))
+        unknown = ", ".join(repr(key) for key in unknown_keys)
+        raise SystemExit(
+            f"{MODEL_CONFIG_FILENAME} contains unknown top-level key(s): {unknown}; "
+            f"allowed keys: {allowed}"
+        )
 
     default_model = read_optional_non_empty_string(payload, "default_model", MODEL_CONFIG_FILENAME)
     default_effort = read_optional_non_empty_string(payload, "default_effort", MODEL_CONFIG_FILENAME)
@@ -61,6 +87,12 @@ def load_model_config(root: Path) -> ModelConfig:
         MODEL_CONFIG_FILENAME,
         default=DEFAULT_CLAUDE_CODE_TIMEOUT_SEC,
     )
+    harbor_check_timeout_sec = read_positive_number(
+        payload,
+        "harbor_check_timeout_sec",
+        MODEL_CONFIG_FILENAME,
+        default=DEFAULT_HARBOR_CHECK_TIMEOUT_SEC,
+    )
     if default_effort is not None and default_effort not in EFFORT_LEVELS:
         allowed = ", ".join(EFFORT_LEVELS)
         raise SystemExit(f"{MODEL_CONFIG_FILENAME}.default_effort must be one of: {allowed}")
@@ -71,6 +103,7 @@ def load_model_config(root: Path) -> ModelConfig:
         phase_efforts=phase_efforts,
         claude_code_path=claude_code_path,
         claude_code_timeout_sec=claude_code_timeout_sec,
+        harbor_check_timeout_sec=harbor_check_timeout_sec,
     )
 
 
@@ -184,3 +217,7 @@ def resolve_claude_code_path(root: Path) -> Path | None:
 
 def resolve_claude_code_timeout_sec(root: Path) -> float:
     return load_model_config(root).claude_code_timeout_sec
+
+
+def resolve_harbor_check_timeout_sec(root: Path) -> float:
+    return load_model_config(root).harbor_check_timeout_sec

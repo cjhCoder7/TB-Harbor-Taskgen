@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -12,11 +13,18 @@ from typing import Any
 
 from taskgen.common import (
     ValidationReport,
+    append_jsonl_object,
+    delegated_phase_subject_lock_kwargs,
     load_json,
+    phase_subject_lock,
     print_report,
     project_root,
+    read_jsonl_objects,
+    require_no_template_markers,
     require_object,
     require_string,
+    select_new_claude_session,
+    validate_claude_session_reference,
 )
 from taskgen.config import EFFORT_LEVELS, resolve_effort_level, resolve_model_name
 from taskgen.phases.phase3_task_generation import (
@@ -79,11 +87,15 @@ def session_ref_for(root: Path, session_dir: Path) -> str:
 
 
 def find_new_session_ref(root: Path, seed_id: str, idea_id: str, before: set[Path]) -> str | None:
-    created = list(list_session_dirs(root, seed_id, idea_id) - before)
-    if not created:
-        return None
-    created.sort(key=lambda path: path.stat().st_mtime_ns, reverse=True)
-    return session_ref_for(root, created[0])
+    subject = subject_for(seed_id, idea_id)
+    session_dir, _ = select_new_claude_session(
+        root,
+        expected_phase=PHASE_NAME,
+        expected_subject=subject,
+        expected_outputs=[f"runs/reviews/{subject}"],
+        before=before,
+    )
+    return session_ref_for(root, session_dir) if session_dir is not None else None
 
 
 def review_ref(seed_id: str, idea_id: str) -> str:
@@ -106,6 +118,20 @@ def append_manifest_event(
     claude_session_ref: str,
 ) -> None:
     task_id = subject_for(seed_id, idea_id)
+    try:
+        oracle_status = json.loads(
+            (root / oracle_status_ref(seed_id, idea_id)).read_text(encoding="utf-8")
+        )
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"cannot read phase4 lineage for reviewed event: {exc}") from exc
+    if not isinstance(oracle_status, dict):
+        raise ValueError("cannot read phase4 lineage for reviewed event: status must be an object")
+    phase4_run_id = oracle_status.get("run_id")
+    task_tree_sha256 = oracle_status.get("task_tree_sha256")
+    if not isinstance(phase4_run_id, str) or not phase4_run_id.strip():
+        raise ValueError("cannot record reviewed event without a phase4 run_id")
+    if not isinstance(task_tree_sha256, str) or not re.fullmatch(r"[0-9a-f]{64}", task_tree_sha256):
+        raise ValueError("cannot record reviewed event without a valid task_tree_sha256")
     payload = {
         "event": "reviewed",
         "seed_id": seed_id,
@@ -114,15 +140,15 @@ def append_manifest_event(
         "review_ref": review_ref(seed_id, idea_id),
         "review_markdown_ref": review_markdown_ref(seed_id, idea_id),
         "oracle_nop_ref": oracle_status_ref(seed_id, idea_id),
+        "phase4_run_id": phase4_run_id,
+        "task_tree_sha256": task_tree_sha256,
         "decision": decision,
         "claude_session_ref": claude_session_ref,
         "status": "reviewed",
         "reason": f"phase 5 review completed with decision {decision!r}",
     }
     manifest_path = root / "runs/task-manifest.jsonl"
-    manifest_path.parent.mkdir(parents=True, exist_ok=True)
-    with manifest_path.open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n")
+    append_jsonl_object(manifest_path, payload)
 
 
 def ensure_phase5_inputs(root: Path, seed_id: str, idea_id: str) -> list[str]:
@@ -159,6 +185,10 @@ def render_phase5_prompt(root: Path, seed_id: str, idea_id: str) -> Path:
     }
     for marker, value in replacements.items():
         prompt = prompt.replace(marker, value)
+    unreplaced = [marker for marker in replacements if marker in prompt]
+    if unreplaced:
+        raise SystemExit(f"phase5 prompt contains unreplaced marker(s): {', '.join(unreplaced)}")
+    require_no_template_markers(prompt, "phase5 prompt")
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(prompt, encoding="utf-8")
     return output_path
@@ -205,6 +235,7 @@ def validate_phase5(root: Path, seed_id: str, idea_id: str, *, require_manifest:
 
     payload = load_json(review_json_path, report)
     decision: str | None = None
+    review: dict[str, Any] | None = None
     if payload is not None:
         review = require_object(payload, "$", report)
         if review is not None:
@@ -216,7 +247,7 @@ def validate_phase5(root: Path, seed_id: str, idea_id: str, *, require_manifest:
     if not review_md_path.is_file():
         report.errors.append(f"missing review markdown: {review_md_path}")
     else:
-        validate_review_markdown(review_md_path, report)
+        validate_review_markdown(review_md_path, report, review)
 
     if require_manifest and decision is not None:
         validate_manifest_event(root, seed_id, idea_id, decision, report)
@@ -338,7 +369,32 @@ def validate_evidence(value: Any, path: str, report: ValidationReport) -> None:
             report.errors.append(f"{path}[{index}] must be a non-empty string")
 
 
-def validate_review_markdown(path: Path, report: ValidationReport) -> None:
+def _clean_markdown_label(line: str) -> str:
+    cleaned = line.strip().lstrip("#>*-+ ").strip()
+    return cleaned.replace("**", "").replace("__", "").replace("`", "").strip()
+
+
+def _section_content(lines: list[str], index: int, remainder: str) -> str:
+    if remainder.strip(" :：-\t"):
+        return remainder.strip(" :：-\t")
+    for following in lines[index + 1 :]:
+        candidate = _clean_markdown_label(following)
+        if candidate:
+            if re.match(
+                r"^(?:(?:final\s+)?decision|summary|modification\s+items?|blocking\s+reasons?)\b",
+                candidate,
+                re.IGNORECASE,
+            ):
+                return ""
+            return candidate
+    return ""
+
+
+def validate_review_markdown(
+    path: Path,
+    report: ValidationReport,
+    review: dict[str, Any] | None = None,
+) -> None:
     try:
         text = path.read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError) as exc:
@@ -346,6 +402,54 @@ def validate_review_markdown(path: Path, report: ValidationReport) -> None:
         return
     if not text.strip():
         report.errors.append(f"review markdown must be non-empty: {path}")
+        return
+
+    lines = text.splitlines()
+    section_patterns = {
+        "summary": re.compile(r"^summary\b\s*(.*)$", re.IGNORECASE),
+        "modification items": re.compile(r"^modification\s+items?\b\s*(.*)$", re.IGNORECASE),
+        "blocking reasons": re.compile(r"^blocking\s+reasons?\b\s*(.*)$", re.IGNORECASE),
+    }
+    found_sections: dict[str, str] = {}
+    declared_decisions: list[str] = []
+    decision_pattern = re.compile(r"^(?:final\s+)?decision\b\s*(.*)$", re.IGNORECASE)
+    decision_value_pattern = re.compile(
+        r"\b(ready|needs[_ -]modification|rejected)\b",
+        re.IGNORECASE,
+    )
+
+    for index, raw_line in enumerate(lines):
+        line = _clean_markdown_label(raw_line)
+        decision_match = decision_pattern.match(line)
+        if decision_match:
+            content = _section_content(lines, index, decision_match.group(1))
+            value_match = decision_value_pattern.search(content)
+            if value_match:
+                declared_decisions.append(value_match.group(1).lower().replace(" ", "_").replace("-", "_"))
+            continue
+        for label, pattern in section_patterns.items():
+            match = pattern.match(line)
+            if match and label not in found_sections:
+                found_sections[label] = _section_content(lines, index, match.group(1))
+
+    if not declared_decisions:
+        report.errors.append("review markdown must explicitly state the final decision")
+    else:
+        expected_decision = review.get("decision") if isinstance(review, dict) else None
+        distinct = set(declared_decisions)
+        if expected_decision in DECISIONS and distinct != {expected_decision}:
+            report.errors.append(
+                "review markdown decision must only state the same decision as review.json: "
+                f"expected {expected_decision!r}, got {sorted(distinct)!r}"
+            )
+        elif expected_decision not in DECISIONS and len(distinct) != 1:
+            report.errors.append("review markdown must state exactly one final decision")
+
+    for label in ("summary", "modification items", "blocking reasons"):
+        if label not in found_sections:
+            report.errors.append(f"review markdown must include a {label} section")
+        elif not found_sections[label].strip():
+            report.errors.append(f"review markdown {label} section must contain text")
 
 
 def validate_manifest_event(
@@ -362,18 +466,19 @@ def validate_manifest_event(
         return
 
     task_id = subject_for(seed_id, idea_id)
+    oracle_payload = load_json(root / oracle_status_ref(seed_id, idea_id), report)
+    oracle_status = (
+        require_object(oracle_payload, "$.oracle_nop_manifest", report)
+        if oracle_payload is not None
+        else None
+    )
+    expected_phase4_run_id = oracle_status.get("run_id") if oracle_status is not None else None
+    expected_task_hash = (
+        oracle_status.get("task_tree_sha256") if oracle_status is not None else None
+    )
     found = False
     candidate_errors: list[str] = []
-    for line_number, line in enumerate(manifest_path.read_text(encoding="utf-8").splitlines(), start=1):
-        if not line.strip():
-            continue
-        try:
-            event = json.loads(line)
-        except json.JSONDecodeError as exc:
-            report.errors.append(f"invalid JSONL at {manifest_path}:{line_number}: {exc}")
-            continue
-        if not isinstance(event, dict):
-            continue
+    for line_number, event in read_jsonl_objects(manifest_path, report):
         if not (
             event.get("event") == "reviewed"
             and event.get("seed_id") == seed_id
@@ -382,6 +487,8 @@ def validate_manifest_event(
             and event.get("review_ref") == review_ref(seed_id, idea_id)
             and event.get("review_markdown_ref") == review_markdown_ref(seed_id, idea_id)
             and event.get("oracle_nop_ref") == oracle_status_ref(seed_id, idea_id)
+            and event.get("phase4_run_id") == expected_phase4_run_id
+            and event.get("task_tree_sha256") == expected_task_hash
             and event.get("decision") == decision
         ):
             continue
@@ -405,24 +512,24 @@ def validate_manifest_candidate(root: Path, event: dict[str, Any], report: Valid
     if not isinstance(event.get("reason"), str) or not event["reason"].strip():
         errors.append("reason must be a non-empty string")
 
-    claude_session_ref = event.get("claude_session_ref")
-    if not isinstance(claude_session_ref, str) or not claude_session_ref.strip():
-        errors.append("claude_session_ref must be a non-empty string")
-        return errors
-
-    session_path = root / claude_session_ref
-    report.checked_paths.append(str(session_path))
-    if not session_path.is_dir():
-        errors.append(f"claude_session_ref does not point to a directory: {claude_session_ref}")
-    elif not (session_path / "status.json").is_file():
-        errors.append(f"claude_session_ref is missing status.json: {claude_session_ref}")
+    subject = str(event.get("task_id"))
+    errors.extend(
+        validate_claude_session_reference(
+            root,
+            event.get("claude_session_ref"),
+            expected_phase=PHASE_NAME,
+            expected_subject=subject,
+            expected_outputs=[f"runs/reviews/{subject}"],
+            report=report,
+        )
+    )
     return errors
 
 
 def load_review_decision_for_manifest(root: Path, seed_id: str, idea_id: str) -> str | None:
     try:
         payload = json.loads(review_json_path_for(root, seed_id, idea_id).read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+    except (OSError, UnicodeError, json.JSONDecodeError):
         return None
     if not isinstance(payload, dict):
         return None
@@ -430,7 +537,7 @@ def load_review_decision_for_manifest(root: Path, seed_id: str, idea_id: str) ->
     return decision if isinstance(decision, str) and decision.strip() else None
 
 
-def command_run(args: argparse.Namespace) -> int:
+def _command_run_locked(args: argparse.Namespace) -> int:
     root = project_root()
     errors = ensure_phase5_inputs(root, args.seed_id, args.idea_id)
     if errors:
@@ -452,10 +559,29 @@ def command_run(args: argparse.Namespace) -> int:
     if args.dry_run:
         return 0
 
+    subject = subject_for(args.seed_id, args.idea_id)
     before_sessions = list_session_dirs(root, args.seed_id, args.idea_id)
-    exit_code = subprocess.run(command, cwd=root, check=False).returncode
+    exit_code = subprocess.run(
+        command,
+        cwd=root,
+        check=False,
+        **delegated_phase_subject_lock_kwargs(root, subject),
+    ).returncode
     if exit_code != 0:
         return exit_code
+
+    session_dir, session_errors = select_new_claude_session(
+        root,
+        expected_phase=PHASE_NAME,
+        expected_subject=subject,
+        expected_outputs=[f"runs/reviews/{subject}"],
+        before=before_sessions,
+    )
+    if session_dir is None:
+        print("cannot append manifest: Claude session validation failed", file=sys.stderr)
+        for error in session_errors:
+            print(f"- {error}", file=sys.stderr)
+        return 1
 
     print()
     print("validating phase5 review output...")
@@ -464,20 +590,28 @@ def command_run(args: argparse.Namespace) -> int:
     if review_exit_code != 0:
         return review_exit_code
 
-    claude_session_ref = find_new_session_ref(root, args.seed_id, args.idea_id, before_sessions)
-    if claude_session_ref is None:
-        print("cannot append manifest: no Claude phase5 session directory was found", file=sys.stderr)
-        return 1
-
     decision = load_review_decision_for_manifest(root, args.seed_id, args.idea_id)
     if decision is None:
         print("cannot append manifest: review decision is missing", file=sys.stderr)
         return 1
-    append_manifest_event(root, args.seed_id, args.idea_id, decision, claude_session_ref)
+    append_manifest_event(
+        root,
+        args.seed_id,
+        args.idea_id,
+        decision,
+        session_ref_for(root, session_dir),
+    )
 
     print()
     print("validating phase5 manifest...")
     return print_report(validate_phase5(root, args.seed_id, args.idea_id), as_json=False)
+
+
+def command_run(args: argparse.Namespace) -> int:
+    root = project_root()
+    subject = subject_for(args.seed_id, args.idea_id)
+    with phase_subject_lock(root, PHASE_NAME, subject):
+        return _command_run_locked(args)
 
 
 def command_validate(args: argparse.Namespace) -> int:

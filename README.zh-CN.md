@@ -57,6 +57,8 @@ TB-Harbor-Taskgen 是一个本地任务生成流水线。它从一个只读 Term
 <seed_id>__<idea_id>
 ```
 
+ID 使用 `[A-Za-z0-9._-]+`，不能包含保留分隔符 `__`；seed 最长 128 个字符，idea 最长 120 个字符。
+
 仓库当前不包含 seed 数据。运行流水线前，请先把 seed task 放到
 `seeds/<seed_id>/`，并按项目需要决定这些输入是否提交。
 
@@ -165,7 +167,8 @@ flowchart LR
 {
   "claude_code_path": "cc-binary/claude-2.1.169-linux-x64",
   "claude_code_timeout_sec": 1800,
-  "default_model": "anthropic/claude-opus-4.8",
+  "harbor_check_timeout_sec": 10800,
+  "default_model": "claude-opus-4-8",
   "default_effort": "max",
   "phase_efforts": {
     "phase1": "max",
@@ -180,6 +183,8 @@ flowchart LR
 `claude_code_path` 指向 `cc-binary/` 下的本地 Claude Code 可执行文件。请保持这个相对路径与运行机器上的实际 binary 一致；下载的可执行文件不提交到仓库。
 
 `claude_code_timeout_sec` 是每次 Claude Code 运行的超时时间，单位为秒，且必须为正数。默认值 `1800` 表示 30 分钟；达到该时限后，runner 会在项目使用的 POSIX/Linux 运行环境中终止本次 Claude Code 的整个进程组，并在 session status 中记录退出码 `124` 和 `timed_out: true`。
+
+`harbor_check_timeout_sec` 是每次 Harbor oracle 或 nop 检查的外层超时时间。默认值 `10800` 秒高于生成任务通常使用的两小时 agent 时限，同时避免 Harbor、Docker 或其子进程永久挂起。
 
 如果需要把 Claude Code binary 下载到指定目录，可以把 `CLAUDE_BIN_DIR` 改成目标目录：
 
@@ -229,6 +234,8 @@ runs/task-manifest.jsonl                    # append-only audit manifest
 ```bash
 scripts/clean-intermediate.sh --apply
 ```
+
+清理命令默认保留 append-only 的 `runs/task-manifest.jsonl`，并在检测到活跃流水线时拒绝执行。仅在确实需要删除审计历史时使用 `--drop-manifest`；`--force-active` 会绕过活跃运行保护，只应用于故障恢复。若存在待恢复的事务日志，清理同样会拒绝；只有显式传入破坏性的 `--discard-transactions` 才会丢弃它们。
 
 ## 开发
 
