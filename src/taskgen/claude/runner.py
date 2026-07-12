@@ -32,6 +32,7 @@ from taskgen.common import (
 from taskgen.config import (
     EFFORT_LEVELS,
     ModelConfig,
+    claude_code_timeout_for_phase,
     load_model_config,
     phase_effort_lookup_keys,
 )
@@ -271,7 +272,7 @@ def run_prepared_claude_logged(
                 break
     if effort is None:
         effort = config.default_effort
-    timeout_sec = config.claude_code_timeout_sec
+    timeout_sec = claude_code_timeout_for_phase(config, args.phase)
     command = build_claude_command(root, model, effort, prompt, config=config)
 
     env = os.environ.copy()

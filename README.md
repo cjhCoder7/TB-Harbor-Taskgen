@@ -178,6 +178,10 @@ and optionally the Claude Code binary:
 {
   "claude_code_path": "cc-binary/claude-2.1.169-linux-x64",
   "claude_code_timeout_sec": 1800,
+  "claude_code_phase_timeouts_sec": {
+    "phase3": 10800,
+    "phase6": 10800
+  },
   "harbor_check_timeout_sec": 10800,
   "default_model": "claude-opus-4-8",
   "default_effort": "max",
@@ -201,10 +205,20 @@ the limit is reached, the runner terminates that Claude Code process group and
 records exit code `124` with `timed_out: true` in the session status. Process
 group cleanup applies to the project's POSIX/Linux runtime.
 
+`claude_code_phase_timeouts_sec` optionally overrides that fallback for named
+phases. Its keys use the same canonical phase names and aliases as
+`phase_efforts`, and every value must be a positive finite number. The shipped
+configuration gives phase3 generation and phase6 repair `10800` seconds (three
+hours), while all other Claude phases retain the 30-minute global fallback.
+
 `harbor_check_timeout_sec` is the supervisor timeout for each Harbor oracle or
 nop check. The default `10800` seconds leaves headroom above the generated
 task's normal two-hour agent limit while preventing a stuck Harbor or Docker
 process from waiting forever.
+
+The optional early Harbor oracle and nop checks in the phase3 and phase6
+prompts honor `HARBOR_BIN` and are each capped at 900 seconds. These checks are
+best-effort feedback for Claude; phase4 remains the authoritative validation.
 
 To download the Claude Code binary into a specific directory, change
 `CLAUDE_BIN_DIR` to the target location:
@@ -265,6 +279,9 @@ refuses to run while a pipeline session is active. Use `--drop-manifest` only
 when audit history should also be removed; `--force-active` bypasses the active
 run guard and should be reserved for recovery. Pending crash-recovery journals
 also block cleanup; `--discard-transactions` is the explicit destructive override.
+Both listing and deletion refuse symlinked cleanup containers or symlinked
+ancestors. If a cleanup target itself is a symlink, only that link is removed;
+the linked directory is never traversed or deleted.
 
 ## Development
 

@@ -397,12 +397,13 @@ def recover_interrupted_finalization(
     seed_id: str,
     idea_id: str,
     require_passed: bool = True,
-) -> None:
-    """Finish or roll back a previously interrupted rename transaction."""
+    apply: bool = True,
+) -> str | None:
+    """Plan, then optionally finish or roll back an interrupted transaction."""
     journal_path = finalization_journal_path(root, source)
     require_safe_finalization_paths(root, (journal_path, "phase7 recovery journal"))
     if not journal_path.is_file():
-        return
+        return None
     try:
         payload = json.loads(journal_path.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
@@ -485,7 +486,8 @@ def recover_interrupted_finalization(
         if recovery_report.errors:
             switch_complete = False
             print(
-                "phase7 recovery: final destination validation failed; rolling back",
+                "phase7 recovery: final destination validation failed; "
+                f"{'rolling back' if apply else 'would roll back'}",
                 file=sys.stderr,
             )
             for error in recovery_report.errors:
@@ -495,6 +497,8 @@ def recover_interrupted_finalization(
             raise FinalizationError(
                 "phase7 recovery cannot commit because the final destination is missing or unsafe"
             )
+        if not apply:
+            return "commit"
         for temporary in (
             source_backup,
             destination_backup,
@@ -506,7 +510,7 @@ def recover_interrupted_finalization(
         journal_path.unlink(missing_ok=True)
         fsync_parent_directory(journal_path)
         print(f"phase7 recovery: completed interrupted final switch at {destination}")
-        return
+        return "commit"
 
     rollback_errors: list[str] = []
     destination_existed = payload.get("destination_existed") is True
@@ -542,6 +546,8 @@ def recover_interrupted_finalization(
             "phase7 interrupted transaction cannot be rolled back safely: "
             + "; ".join(rollback_errors)
         )
+    if not apply:
+        return "rollback"
 
     try:
         if source_backup_exists:
@@ -578,6 +584,7 @@ def recover_interrupted_finalization(
             f"cannot persist phase7 interrupted-transaction recovery: {exc}"
         ) from exc
     print("phase7 recovery: rolled back an interrupted final switch")
+    return "rollback"
 
 
 @contextlib.contextmanager
@@ -829,7 +836,7 @@ def run_phase7_locked(root: Path, args: argparse.Namespace) -> int:
         return 1
 
     try:
-        recover_interrupted_finalization(
+        recovery_action = recover_interrupted_finalization(
             root,
             source,
             destination,
@@ -837,10 +844,24 @@ def run_phase7_locked(root: Path, args: argparse.Namespace) -> int:
             seed_id=args.seed_id,
             idea_id=args.idea_id,
             require_passed=decision == "ready",
+            apply=not args.dry_run,
         )
     except (OSError, FinalizationError) as exc:
         print(f"phase7 recovery failed: {exc}", file=sys.stderr)
         return 1
+
+    if args.dry_run and recovery_action is not None:
+        if recovery_action == "commit":
+            print(
+                "phase7 recovery would complete the interrupted final switch "
+                f"at {destination} and remove its recovery journal and temporary paths"
+            )
+        else:
+            print(
+                "phase7 recovery would roll back the interrupted final switch "
+                "and remove its recovery journal and temporary paths"
+            )
+        return 0
 
     if not source.exists() and destination.is_dir():
         print(f"phase7 recovery: reusing finalized task at {destination}")

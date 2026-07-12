@@ -22,7 +22,7 @@ Required work:
 4. Apply only the repairs needed to address `modification_items`.
 5. Preserve the same task concept unless the review explicitly says a narrow concept adjustment is required.
 6. Write a complete repaired TB3 Harbor task under `output/task/`.
-7. If Harbor is available, run one workspace-local oracle check and one workspace-local nop check against `output/task/`. Fix clear repair bugs before finishing when practical.
+7. If Harbor is available, run one workspace-local oracle check and one workspace-local nop check against `output/task/`, capped at 900 seconds each. Fix clear repair bugs before finishing when practical.
 8. Stop.
 
 Minimum required output skeleton:
@@ -75,11 +75,12 @@ Optional Harbor validation:
 
 ```bash
 mkdir -p output/local-validation/harbor-jobs
-harbor run -p output/task -a oracle -o output/local-validation/harbor-jobs --job-name oracle -k 1 -y > output/local-validation/oracle.log 2>&1
-harbor run -p output/task -a nop -o output/local-validation/harbor-jobs --job-name nop -k 1 -y > output/local-validation/nop.log 2>&1
+HARBOR_COMMAND="${HARBOR_BIN:-harbor}"
+timeout -k 30s 870s "$HARBOR_COMMAND" run -p output/task -a oracle -o output/local-validation/harbor-jobs --job-name oracle -k 1 -y > output/local-validation/oracle.log 2>&1
+timeout -k 30s 870s "$HARBOR_COMMAND" run -p output/task -a nop -o output/local-validation/harbor-jobs --job-name nop -k 1 -y > output/local-validation/nop.log 2>&1
 ```
 
-If Harbor or Docker is unavailable, record the failed command and error under `output/local-validation/` and continue with static checks. Expected signal is oracle reward `1` and nop reward `0`.
+Each early Harbor invocation has a 900-second wall-clock budget: `timeout` sends `TERM` at 870 seconds and allows a 30-second grace period before `KILL`. Exit code `124`, or `137` when the hard kill is needed, indicates a timeout. If Harbor, Docker, or `timeout` is unavailable, or a check times out, record the failed command and error under `output/local-validation/` and continue with static checks. Expected signal is oracle reward `1` and nop reward `0`. The pipeline's phase4 check remains the authoritative validation.
 
 Final validation:
 

@@ -167,6 +167,10 @@ flowchart LR
 {
   "claude_code_path": "cc-binary/claude-2.1.169-linux-x64",
   "claude_code_timeout_sec": 1800,
+  "claude_code_phase_timeouts_sec": {
+    "phase3": 10800,
+    "phase6": 10800
+  },
   "harbor_check_timeout_sec": 10800,
   "default_model": "claude-opus-4-8",
   "default_effort": "max",
@@ -184,7 +188,11 @@ flowchart LR
 
 `claude_code_timeout_sec` 是每次 Claude Code 运行的超时时间，单位为秒，且必须为正数。默认值 `1800` 表示 30 分钟；达到该时限后，runner 会在项目使用的 POSIX/Linux 运行环境中终止本次 Claude Code 的整个进程组，并在 session status 中记录退出码 `124` 和 `timed_out: true`。
 
+`claude_code_phase_timeouts_sec` 可按 phase 覆盖上述兜底值。key 与 `phase_efforts` 使用相同的 canonical phase name 和 alias，每个值都必须是正有限数。仓库配置把 phase3 生成和 phase6 修复设为 `10800` 秒（3 小时），其他 Claude phase 仍使用全局 30 分钟兜底值。
+
 `harbor_check_timeout_sec` 是每次 Harbor oracle 或 nop 检查的外层超时时间。默认值 `10800` 秒高于生成任务通常使用的两小时 agent 时限，同时避免 Harbor、Docker 或其子进程永久挂起。
+
+phase3 和 phase6 提示词中的可选早期 Harbor oracle/nop 检查会使用 `HARBOR_BIN`，并且每次最多运行 900 秒。这些检查只为 Claude 提供尽早反馈，phase4 仍是正式验证。
 
 如果需要把 Claude Code binary 下载到指定目录，可以把 `CLAUDE_BIN_DIR` 改成目标目录：
 
@@ -235,7 +243,7 @@ runs/task-manifest.jsonl                    # append-only audit manifest
 scripts/clean-intermediate.sh --apply
 ```
 
-清理命令默认保留 append-only 的 `runs/task-manifest.jsonl`，并在检测到活跃流水线时拒绝执行。仅在确实需要删除审计历史时使用 `--drop-manifest`；`--force-active` 会绕过活跃运行保护，只应用于故障恢复。若存在待恢复的事务日志，清理同样会拒绝；只有显式传入破坏性的 `--discard-transactions` 才会丢弃它们。
+清理命令默认保留 append-only 的 `runs/task-manifest.jsonl`，并在检测到活跃流水线时拒绝执行。仅在确实需要删除审计历史时使用 `--drop-manifest`；`--force-active` 会绕过活跃运行保护，只应用于故障恢复。若存在待恢复的事务日志，清理同样会拒绝；只有显式传入破坏性的 `--discard-transactions` 才会丢弃它们。无论只列出还是实际删除，命令都会拒绝 symlink cleanup container 或带 symlink ancestor 的目标；若目标本身是 symlink，则只删除链接，不会遍历或删除链接指向的目录。
 
 ## 开发
 

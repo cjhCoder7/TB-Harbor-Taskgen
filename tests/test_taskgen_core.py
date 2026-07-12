@@ -44,7 +44,12 @@ from taskgen.cli import (
     load_pipeline_idea_ids,
     pipeline_phase1_count_matches,
 )
-from taskgen.config import load_model_config, resolve_claude_code_path, resolve_effort_level
+from taskgen.config import (
+    load_model_config,
+    resolve_claude_code_path,
+    resolve_claude_code_timeout_sec,
+    resolve_effort_level,
+)
 from taskgen.common import (
     ValidationReport,
     append_jsonl_object,
@@ -232,7 +237,57 @@ class ModelConfigTests(unittest.TestCase):
             config = load_model_config(Path(tmp))
 
         self.assertEqual(config.claude_code_timeout_sec, 1800.0)
+        self.assertEqual(config.claude_code_phase_timeouts_sec, {})
         self.assertEqual(config.harbor_check_timeout_sec, 10800.0)
+
+    def test_phase_timeout_overrides_global_timeout_for_canonical_phase_and_alias(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "model.json").write_text(
+                json.dumps(
+                    {
+                        "claude_code_timeout_sec": 1800,
+                        "claude_code_phase_timeouts_sec": {
+                            "phase3": 10800,
+                            "task-repair": 7200.5,
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            config = load_model_config(root)
+
+            self.assertEqual(config.claude_code_phase_timeouts_sec["phase3"], 10800.0)
+            self.assertEqual(
+                config.claude_code_phase_timeouts_sec["task-repair"],
+                7200.5,
+            )
+            self.assertEqual(resolve_claude_code_timeout_sec(root, "task-generation"), 10800.0)
+            self.assertEqual(resolve_claude_code_timeout_sec(root, "phase6"), 7200.5)
+            self.assertEqual(resolve_claude_code_timeout_sec(root, "seed-brainstorm"), 1800.0)
+
+    def test_invalid_phase_timeout_configuration_fails_fast(self) -> None:
+        invalid_values = (
+            [],
+            {"phase3": 0},
+            {"phase3": -1},
+            {"phase3": True},
+            {"phase3": "10800"},
+            {"phase3": float("nan")},
+            {"phase3": float("inf")},
+            {"phasex": 10800},
+        )
+        for invalid_value in invalid_values:
+            with self.subTest(invalid_value=invalid_value), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                (root / "model.json").write_text(
+                    json.dumps({"claude_code_phase_timeouts_sec": invalid_value}),
+                    encoding="utf-8",
+                )
+
+                with self.assertRaisesRegex(SystemExit, "claude_code_phase_timeouts_sec"):
+                    load_model_config(root)
 
     def test_harbor_timeout_is_configurable_and_strictly_positive(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -362,10 +417,20 @@ class ClaudeRunnerTests(unittest.TestCase):
         self.assertIn("Bash(*locate *)", command)
         self.assertLess(command.index("--disallowedTools"), command.index("--print"))
 
-    def test_run_claude_passes_configured_timeout_to_subprocess(self) -> None:
+    def test_run_claude_passes_phase_timeout_override_to_subprocess(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             workspace_payload, args = fake_claude_runner_fixture(root)
+            args.phase = "task-generation"
+            (root / "model.json").write_text(
+                json.dumps(
+                    {
+                        "claude_code_timeout_sec": 75,
+                        "claude_code_phase_timeouts_sec": {"phase3": 10800},
+                    }
+                ),
+                encoding="utf-8",
+            )
             process = MagicMock()
             process.wait.return_value = 1
 
@@ -381,9 +446,9 @@ class ClaudeRunnerTests(unittest.TestCase):
 
         self.assertEqual(exit_code, 1)
         self.assertIs(popen.call_args.kwargs["start_new_session"], True)
-        process.wait.assert_called_once_with(timeout=75.0)
+        process.wait.assert_called_once_with(timeout=10800.0)
         self.assertIs(write_status.call_args.kwargs["timed_out"], False)
-        self.assertEqual(write_status.call_args.kwargs["timeout_sec"], 75.0)
+        self.assertEqual(write_status.call_args.kwargs["timeout_sec"], 10800.0)
 
     def test_run_claude_records_timeout_without_syncing_outputs(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -2853,6 +2918,38 @@ class Phase6RepairTests(unittest.TestCase):
 
 
 class CleanupHardeningTests(unittest.TestCase):
+    @unittest.skipUnless(hasattr(os, "symlink"), "symbolic links are unavailable")
+    def test_cleanup_refuses_symlinked_runs_ancestor_without_touching_external_files(self) -> None:
+        for apply in (False, True):
+            with (
+                self.subTest(apply=apply),
+                tempfile.TemporaryDirectory() as project_tmp,
+                tempfile.TemporaryDirectory() as outside_tmp,
+            ):
+                project = Path(project_tmp)
+                outside = Path(outside_tmp)
+                victim = outside / "reviews/subject/review.json"
+                victim.parent.mkdir(parents=True)
+                victim.write_text("external", encoding="utf-8")
+                (project / "runs").symlink_to(outside, target_is_directory=True)
+
+                with patch(
+                    "taskgen.maintenance.clean_intermediate.project_root",
+                    return_value=project,
+                ):
+                    exit_code = command_clean(
+                        SimpleNamespace(
+                            apply=apply,
+                            drop_manifest=False,
+                            force_active=False,
+                            discard_transactions=False,
+                        )
+                    )
+
+                self.assertEqual(exit_code, 1)
+                self.assertTrue((project / "runs").is_symlink())
+                self.assertEqual(victim.read_text(encoding="utf-8"), "external")
+
     def test_cleanup_preserves_manifest_by_default_and_drops_only_when_explicit(self) -> None:
         with tempfile.TemporaryDirectory() as project_tmp:
             project = Path(project_tmp)
@@ -2966,6 +3063,59 @@ class CleanupHardeningTests(unittest.TestCase):
             self.assertTrue(reviews.is_dir())
             self.assertFalse(reviews.is_symlink())
 
+    @unittest.skipUnless(hasattr(os, "symlink"), "symbolic links are unavailable")
+    def test_cleanup_unlinks_leaf_directory_symlink_without_touching_target(self) -> None:
+        with (
+            tempfile.TemporaryDirectory() as project_tmp,
+            tempfile.TemporaryDirectory() as outside_tmp,
+        ):
+            project = Path(project_tmp)
+            outside_reviews = Path(outside_tmp)
+            victim = outside_reviews / "subject/review.json"
+            victim.parent.mkdir(parents=True)
+            victim.write_text("external", encoding="utf-8")
+            reviews = project / "runs/reviews"
+            reviews.parent.mkdir(parents=True)
+            reviews.symlink_to(outside_reviews, target_is_directory=True)
+
+            with patch("taskgen.maintenance.clean_intermediate.project_root", return_value=project):
+                exit_code = command_clean(
+                    SimpleNamespace(apply=True, drop_manifest=False, force_active=False)
+                )
+
+            self.assertEqual(exit_code, 0)
+            self.assertTrue(reviews.is_dir())
+            self.assertFalse(reviews.is_symlink())
+            self.assertEqual(victim.read_text(encoding="utf-8"), "external")
+
+    @unittest.skipUnless(hasattr(os, "symlink"), "symbolic links are unavailable")
+    def test_cleanup_skips_unrelated_symlink_while_removing_local_pycache(self) -> None:
+        with (
+            tempfile.TemporaryDirectory() as project_tmp,
+            tempfile.TemporaryDirectory() as outside_tmp,
+        ):
+            project = Path(project_tmp)
+            local_cache = project / "src/local/__pycache__"
+            local_cache.mkdir(parents=True)
+            (local_cache / "module.pyc").write_bytes(b"cache")
+            external_cache = Path(outside_tmp) / "vendor/__pycache__"
+            external_cache.mkdir(parents=True)
+            external_file = external_cache / "vendor.pyc"
+            external_file.write_bytes(b"external")
+            (project / "src/vendor").symlink_to(
+                external_cache.parent,
+                target_is_directory=True,
+            )
+
+            with patch("taskgen.maintenance.clean_intermediate.project_root", return_value=project):
+                exit_code = command_clean(
+                    SimpleNamespace(apply=True, drop_manifest=False, force_active=False)
+                )
+
+            self.assertEqual(exit_code, 0)
+            self.assertFalse(local_cache.exists())
+            self.assertEqual(external_file.read_bytes(), b"external")
+
 
 class Phase7FinalizeTests(unittest.TestCase):
     def write_generated_task(self, project: Path) -> Path:
@@ -3077,6 +3227,61 @@ class Phase7FinalizeTests(unittest.TestCase):
         self.write_phase4_status(project, task)
         self.write_review(project, decision)
         return task
+
+    def prepare_interrupted_ready_switch(
+        self,
+        project: Path,
+        *,
+        nonce: str,
+        corrupt_destination: bool = False,
+    ) -> dict[str, Path]:
+        source = self.prepare_inputs(project, "ready")
+        accepted = accepted_task_path(project, "seed-a", "idea-1")
+        rejected = rejected_task_path(project, "seed-a", "idea-1")
+        accepted.mkdir(parents=True)
+        rejected.mkdir(parents=True)
+        (accepted / "old.txt").write_text("accepted", encoding="utf-8")
+        (rejected / "old.txt").write_text("rejected", encoding="utf-8")
+        stage = accepted.parent / f".taskgen-stage-{nonce}"
+        destination_backup = accepted.parent / f".taskgen-final-backup-{nonce}"
+        counterpart_backup = rejected.parent / f".taskgen-counterpart-backup-{nonce}"
+        source_backup = source.parent / f".taskgen-working-backup-{nonce}"
+        shutil.copytree(source, stage)
+        os.replace(accepted, destination_backup)
+        os.replace(rejected, counterpart_backup)
+        os.replace(stage, accepted)
+        os.replace(source, source_backup)
+        if corrupt_destination:
+            (accepted / "task.toml").write_text('version = "corrupted"\n', encoding="utf-8")
+        journal = finalization_journal_path(project, source)
+        journal.parent.mkdir(parents=True)
+        journal.write_text(
+            json.dumps(
+                {
+                    "state": "switched",
+                    "source": str(source),
+                    "destination": str(accepted),
+                    "counterpart": str(rejected),
+                    "stage": str(stage),
+                    "destination_backup": str(destination_backup),
+                    "counterpart_backup": str(counterpart_backup),
+                    "source_backup": str(source_backup),
+                    "destination_existed": True,
+                    "counterpart_existed": True,
+                }
+            ),
+            encoding="utf-8",
+        )
+        return {
+            "source": source,
+            "destination": accepted,
+            "counterpart": rejected,
+            "stage": stage,
+            "destination_backup": destination_backup,
+            "counterpart_backup": counterpart_backup,
+            "source_backup": source_backup,
+            "journal": journal,
+        }
 
     def test_validates_ready_finalization(self) -> None:
         with tempfile.TemporaryDirectory() as project_tmp:
@@ -3308,6 +3513,47 @@ class Phase7FinalizeTests(unittest.TestCase):
                 source_backup,
             ):
                 self.assertFalse(os.path.lexists(temporary))
+
+    def test_phase7_dry_run_only_plans_pending_commit_or_rollback(self) -> None:
+        for corrupt_destination, expected_action in ((False, "commit"), (True, "rollback")):
+            with (
+                self.subTest(expected_action=expected_action),
+                tempfile.TemporaryDirectory() as project_tmp,
+            ):
+                project = Path(project_tmp)
+                paths = self.prepare_interrupted_ready_switch(
+                    project,
+                    nonce=("2" if corrupt_destination else "3") * 32,
+                    corrupt_destination=corrupt_destination,
+                )
+
+                def snapshot() -> dict[str, tuple[str, object]]:
+                    result: dict[str, tuple[str, object]] = {}
+                    for name, path in paths.items():
+                        if path.is_dir() and not path.is_symlink():
+                            result[name] = ("directory", directory_tree_sha256(path))
+                        elif path.is_file() and not path.is_symlink():
+                            result[name] = ("file", path.read_bytes())
+                        elif path.is_symlink():
+                            result[name] = ("symlink", os.readlink(path))
+                        else:
+                            result[name] = ("missing", None)
+                    return result
+
+                before = snapshot()
+                manifest_before = (project / "runs/task-manifest.jsonl").read_bytes()
+
+                exit_code = run_phase7_locked(
+                    project,
+                    SimpleNamespace(seed_id="seed-a", idea_id="idea-1", dry_run=True),
+                )
+
+                self.assertEqual(exit_code, 0)
+                self.assertEqual(snapshot(), before)
+                self.assertEqual(
+                    (project / "runs/task-manifest.jsonl").read_bytes(),
+                    manifest_before,
+                )
 
     def test_phase7_rolls_back_corrupted_interrupted_destination(self) -> None:
         with tempfile.TemporaryDirectory() as project_tmp:

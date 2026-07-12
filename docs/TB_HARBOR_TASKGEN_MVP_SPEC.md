@@ -76,6 +76,10 @@ timeouts, default model, default effort, and per-phase effort levels:
 {
   "claude_code_path": "cc-binary/claude-2.1.169-linux-x64",
   "claude_code_timeout_sec": 1800,
+  "claude_code_phase_timeouts_sec": {
+    "phase3": 10800,
+    "phase6": 10800
+  },
   "harbor_check_timeout_sec": 10800,
   "default_model": "claude-opus-4-8",
   "default_effort": "max",
@@ -101,6 +105,12 @@ and must be positive. The default value `1800` is 30 minutes. When a run reaches
 this limit, the runner terminates its isolated process group and records exit
 code `124` with `timed_out: true`. Process-group cleanup is a POSIX/Linux
 runtime behavior.
+
+`claude_code_phase_timeouts_sec` is an optional per-phase override map. Keys
+accept the same canonical names and aliases as `phase_efforts`; values must be
+positive finite numbers. A matching override takes precedence over
+`claude_code_timeout_sec`. This configuration gives phase3 and phase6 `10800`
+seconds while retaining the 30-minute fallback for all other phases.
 
 `harbor_check_timeout_sec` is the positive, finite supervisor timeout for each
 oracle or nop Harbor invocation. The default is `10800` seconds. A timed-out
@@ -360,6 +370,10 @@ contain workspace input directories, Claude run files, `.pyc`, `.log`, symlinks,
 or local runner paths such as `runs/workspace`, `runs/claude-sessions`, and
 `/shared/users/`.
 
+The generation prompt's best-effort early oracle and nop runs resolve Harbor
+from `HARBOR_BIN` (falling back to `harbor`) and cap each invocation at 900
+seconds. A timeout does not replace the authoritative phase4 validation.
+
 Manifest event: `generated`.
 
 ### Phase 4: Harbor Oracle / Nop Check
@@ -441,6 +455,9 @@ Claude must sync `output/task` back to
 `generated/working/<seed_id>/<idea_id>`. Validation then reuses phase3 task
 validation and checks that the new Claude session synced the repaired task.
 
+As in phase3, each best-effort early Harbor check in the repair prompt is
+capped at 900 seconds and phase4 remains authoritative.
+
 Manifest event: `repaired`.
 
 ### Phase 7: Finalize / Organize
@@ -472,6 +489,11 @@ appends the manifest as a separate irreversible commit point. If that append is
 interrupted, the valid final destination is retained and rerunning phase7 adds
 the missing event. `runs/finalization-transactions/` also lets reruns finish
 backup cleanup or roll back an incomplete switch.
+
+When a finalization journal is pending, phase7 `--dry-run` fully validates the
+journal and reports whether a real run would commit or roll back. It does not
+rename or remove paths, delete the journal, fsync directories, or append a
+manifest event.
 
 Manifest event: `accepted` or `rejected`.
 
@@ -526,6 +548,13 @@ The append-only `runs/task-manifest.jsonl` is preserved unless
 run guard for manual recovery and can disrupt a live run. Pending output-sync
 or finalization journals block cleanup so crash recovery remains possible;
 `--discard-transactions` is the explicit destructive override.
+
+Before either a dry-run listing or deletion, cleanup requires the project root
+and the `runs/`, `src/`, `scripts/`, and `tests/` containers (when present) to
+be real directories. It also rejects targets reached through a symlink or
+non-directory ancestor and does not follow directory symlinks while locating
+Python caches. A cleanup target that is itself a symlink is only unlinked; its
+external target is left untouched.
 
 Current ignore rules keep local credentials, runtime artifacts, generated task
 outputs, Python caches, and the local Claude binary out of git. `model.json`

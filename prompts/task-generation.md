@@ -37,7 +37,7 @@ Required work:
 6. Generate one complete TB3 task under `{{OUTPUT_PATH}}/` without weakening the intended difficulty.
 7. In `task.toml` `difficulty_explanation`, explicitly describe the main logic complexity and the expected implementation/edit scope that make the task sufficiently difficult.
 8. Check directory layout, `task.toml`, path consistency, instruction quality, reward writing, verifier separation, and absence of copied input artifacts.
-9. If Harbor is available, run one early workspace-local oracle check and one early nop check. Fix clear generation bugs before finishing when practical.
+9. If Harbor is available, run one early workspace-local oracle check and one early nop check, capped at 900 seconds each. Fix clear generation bugs before finishing when practical.
 
 Required task tree:
 
@@ -112,11 +112,12 @@ Early Harbor validation:
 
 ```bash
 mkdir -p output/local-validation/harbor-jobs
-harbor run -p output/task -a oracle -o output/local-validation/harbor-jobs --job-name oracle -k 1 -y > output/local-validation/oracle.log 2>&1
-harbor run -p output/task -a nop -o output/local-validation/harbor-jobs --job-name nop -k 1 -y > output/local-validation/nop.log 2>&1
+HARBOR_COMMAND="${HARBOR_BIN:-harbor}"
+timeout -k 30s 870s "$HARBOR_COMMAND" run -p output/task -a oracle -o output/local-validation/harbor-jobs --job-name oracle -k 1 -y > output/local-validation/oracle.log 2>&1
+timeout -k 30s 870s "$HARBOR_COMMAND" run -p output/task -a nop -o output/local-validation/harbor-jobs --job-name nop -k 1 -y > output/local-validation/nop.log 2>&1
 ```
 
-If Harbor or Docker is unavailable, record the failed command and error under `output/local-validation/` and continue with static checks. If you inspect rewards, read only under `output/local-validation/harbor-jobs/`; common locations are `**/result.json`, `**/verifier/reward.txt`, and `**/verifier/reward.json`. Expected signal: oracle reward `1`, nop reward `0`.
+Each early Harbor invocation has a 900-second wall-clock budget: `timeout` sends `TERM` at 870 seconds and allows a 30-second grace period before `KILL`. Exit code `124`, or `137` when the hard kill is needed, indicates a timeout. If Harbor, Docker, or `timeout` is unavailable, or a check times out, record the failed command and error under `output/local-validation/` and continue with static checks. If you inspect rewards, read only under `output/local-validation/harbor-jobs/`; common locations are `**/result.json`, `**/verifier/reward.txt`, and `**/verifier/reward.json`. Expected signal: oracle reward `1`, nop reward `0`. The pipeline's phase4 check remains the authoritative validation.
 
 Final consistency checks:
 

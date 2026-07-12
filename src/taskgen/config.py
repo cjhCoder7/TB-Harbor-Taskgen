@@ -21,6 +21,7 @@ MODEL_CONFIG_KEYS = frozenset(
         "phase_efforts",
         "claude_code_path",
         "claude_code_timeout_sec",
+        "claude_code_phase_timeouts_sec",
         "harbor_check_timeout_sec",
     }
 )
@@ -47,6 +48,7 @@ class ModelConfig:
     phase_efforts: dict[str, str] = field(default_factory=dict)
     claude_code_path: str | None = None
     claude_code_timeout_sec: float = DEFAULT_CLAUDE_CODE_TIMEOUT_SEC
+    claude_code_phase_timeouts_sec: dict[str, float] = field(default_factory=dict)
     harbor_check_timeout_sec: float = DEFAULT_HARBOR_CHECK_TIMEOUT_SEC
 
 
@@ -87,6 +89,7 @@ def load_model_config(root: Path) -> ModelConfig:
         MODEL_CONFIG_FILENAME,
         default=DEFAULT_CLAUDE_CODE_TIMEOUT_SEC,
     )
+    claude_code_phase_timeouts_sec = read_phase_timeouts(payload)
     harbor_check_timeout_sec = read_positive_number(
         payload,
         "harbor_check_timeout_sec",
@@ -103,6 +106,7 @@ def load_model_config(root: Path) -> ModelConfig:
         phase_efforts=phase_efforts,
         claude_code_path=claude_code_path,
         claude_code_timeout_sec=claude_code_timeout_sec,
+        claude_code_phase_timeouts_sec=claude_code_phase_timeouts_sec,
         harbor_check_timeout_sec=harbor_check_timeout_sec,
     )
 
@@ -165,6 +169,34 @@ def read_phase_efforts(payload: dict[str, Any]) -> dict[str, str]:
     return phase_efforts
 
 
+def read_phase_timeouts(payload: dict[str, Any]) -> dict[str, float]:
+    key_name = "claude_code_phase_timeouts_sec"
+    value = payload.get(key_name)
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise SystemExit(f"{MODEL_CONFIG_FILENAME}.{key_name} must be an object when set")
+
+    phase_timeouts: dict[str, float] = {}
+    allowed_keys = ", ".join(sorted(PHASE_EFFORT_KEYS))
+    for raw_key, raw_timeout in value.items():
+        if not isinstance(raw_key, str) or not raw_key.strip():
+            raise SystemExit(f"{MODEL_CONFIG_FILENAME}.{key_name} keys must be non-empty strings")
+        phase_key = raw_key.strip()
+        if phase_key not in PHASE_EFFORT_KEYS:
+            raise SystemExit(
+                f"{MODEL_CONFIG_FILENAME}.{key_name} has unknown phase key {phase_key!r}; "
+                f"expected one of: {allowed_keys}"
+            )
+        phase_timeouts[phase_key] = read_positive_number(
+            {phase_key: raw_timeout},
+            phase_key,
+            f"{MODEL_CONFIG_FILENAME}.{key_name}",
+            default=DEFAULT_CLAUDE_CODE_TIMEOUT_SEC,
+        )
+    return phase_timeouts
+
+
 def phase_effort_lookup_keys(phase: str | None) -> list[str]:
     if phase is None:
         return []
@@ -215,8 +247,16 @@ def resolve_claude_code_path(root: Path) -> Path | None:
     return root / path
 
 
-def resolve_claude_code_timeout_sec(root: Path) -> float:
-    return load_model_config(root).claude_code_timeout_sec
+def claude_code_timeout_for_phase(config: ModelConfig, phase: str | None = None) -> float:
+    for key in phase_effort_lookup_keys(phase):
+        timeout_sec = config.claude_code_phase_timeouts_sec.get(key)
+        if timeout_sec is not None:
+            return timeout_sec
+    return config.claude_code_timeout_sec
+
+
+def resolve_claude_code_timeout_sec(root: Path, phase: str | None = None) -> float:
+    return claude_code_timeout_for_phase(load_model_config(root), phase)
 
 
 def resolve_harbor_check_timeout_sec(root: Path) -> float:

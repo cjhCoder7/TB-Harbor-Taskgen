@@ -69,6 +69,10 @@ phase4 之后使用的稳定 task id 是：
 {
   "claude_code_path": "cc-binary/claude-2.1.169-linux-x64",
   "claude_code_timeout_sec": 1800,
+  "claude_code_phase_timeouts_sec": {
+    "phase3": 10800,
+    "phase6": 10800
+  },
   "harbor_check_timeout_sec": 10800,
   "default_model": "claude-opus-4-8",
   "default_effort": "max",
@@ -87,6 +91,8 @@ phase4 之后使用的稳定 task id 是：
 `claude_code_path` 如果不是绝对路径，会从项目根目录解析。该 binary 是本地文件，并被 git 忽略。如果删除该字段，runner 会先使用唯一一个可执行的 `cc-binary/claude-*`，再回退到 `PATH` 上的 `claude`。
 
 `claude_code_timeout_sec` 设置每次 Claude Code 运行的超时时间，单位为秒，且必须为正数。默认值 `1800` 表示 30 分钟；运行达到该时限后，runner 会在 POSIX/Linux 环境终止其独立进程组，并记录退出码 `124` 和 `timed_out: true`。
+
+`claude_code_phase_timeouts_sec` 是可选的按 phase 覆盖映射。key 支持与 `phase_efforts` 相同的 canonical name 和 alias，value 必须是正有限数；命中的覆盖值优先于 `claude_code_timeout_sec`。当前配置为 phase3 和 phase6 设置 `10800` 秒，其他 phase 保留全局 30 分钟兜底值。
 
 `harbor_check_timeout_sec` 是每次 Harbor oracle 或 nop 调用的正有限外层超时，默认值为 `10800` 秒。检查超时后会在可 review 的 phase4 status 中记录退出码 `124` 和超时元数据。未知的 `model.json` 顶层字段会被拒绝，避免拼写错误静默回退默认值。
 
@@ -295,6 +301,8 @@ generated/working/<seed_id>/<idea_id>/
 
 validation 会检查必需布局、必需目录非空、phase1/phase2 输入一致性，并拒绝 runner artifacts。生成任务不能包含 workspace 输入目录、Claude 运行文件、`.pyc`、`.log`、symlink，或 `runs/workspace`、`runs/claude-sessions`、`/shared/users/` 等本地 runner 路径。
 
+生成提示词中的尽早 oracle/nop 检查是 best-effort：Harbor 优先使用 `HARBOR_BIN`、否则使用 `harbor`，每次调用最多 900 秒。超时不会替代 phase4 的正式验证。
+
 Manifest event：`generated`。
 
 ### Phase 4: Harbor Oracle / Nop Check
@@ -369,6 +377,8 @@ Manifest event：`reviewed`。
 
 Claude 必须把 `output/task` 同步回 `generated/working/<seed_id>/<idea_id>`。验证随后复用 phase3 task validation，并检查新的 Claude session 确实同步了 repaired task。
 
+与 phase3 相同，修复提示词中的每次 best-effort Harbor 检查最多运行 900 秒，phase4 仍是正式验证。
+
 Manifest event：`repaired`。
 
 ### Phase 7: Finalize / Organize
@@ -393,6 +403,8 @@ generated/rejected/<task_id>/
 ```
 
 final task 会先复制并验证到同级 staging directory，再原子切换到目标；切换或验证失败时可恢复旧目标。通过验证的切换提交后，phase7 将 manifest append 作为独立的不可逆 commit point；若 append 中断，会保留有效 final destination，重跑 phase7 可补齐事件。`runs/finalization-transactions/` 也用于补完 backup 清理或回滚尚未完成的切换。
+
+存在待恢复的 finalization journal 时，phase7 `--dry-run` 会完整验证 journal，并报告真实运行将提交还是回滚；它不会 rename 或删除路径、删除 journal、fsync directory，也不会追加 manifest event。
 
 Manifest event：`accepted` 或 `rejected`。
 
@@ -439,6 +451,8 @@ scripts/clean-intermediate.sh --apply --discard-transactions
 
 删除后会恢复 `runs/` 骨架目录和 `.gitkeep` 文件。
 append-only 的 `runs/task-manifest.jsonl` 默认保留，只有显式传入 `--drop-manifest` 才会删除。`--force-active` 可在人工恢复时绕过活跃运行保护，但可能破坏正在执行的 run。存在 output-sync 或 finalization 待恢复日志时，清理会拒绝执行，以保留 crash recovery 能力；`--discard-transactions` 是显式的破坏性覆盖选项。
+
+无论执行 dry-run 列表还是实际删除，清理都要求 project root 以及存在的 `runs/`、`src/`、`scripts/`、`tests/` container 是真实目录；目标若经过 symlink 或非目录 ancestor 会被拒绝，查找 Python cache 时也不会跟随 directory symlink。若 cleanup target 自身是 symlink，则只 unlink 该链接，外部目标保持不变。
 
 当前 ignore 规则会让本地 credentials、运行产物、generated task outputs、Python caches 和本地 Claude binary 不进入 git。`model.json` 仍保留预期的本地 Claude binary 路径。
 
