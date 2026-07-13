@@ -1,8 +1,8 @@
 # Task Generation
 
-Use the `tb-harbor-task-generator` subagent and the `tb-harbor-task-generation` skill.
+Use the `tb-harbor-task-generator` subagent in the current workspace and the `tb-harbor-task-generation` skill. When invoking `Agent`, omit the `isolation` field. Do not create or enter a Git worktree.
 
-You are in an isolated workspace. Work only inside the current directory.
+You are already in an isolated workspace. Work only inside the current directory.
 
 Inputs:
 

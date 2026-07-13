@@ -59,8 +59,7 @@ TB-Harbor-Taskgen 是一个从只读 Terminal-Bench Harbor seed task 生成 TB3 
 
 ID 使用 `[A-Za-z0-9._-]+`，不能包含保留分隔符 `__`；seed 最长 128 个字符，idea 最长 120 个字符。
 
-仓库当前不包含 seed 数据。运行流水线前，请先把 seed task 放到
-`seeds/<seed_id>/`。Seed 内容默认被 git 忽略；如需提交，必须显式覆盖或调整该 ignore 规则。
+仓库当前不包含 seed 数据。运行流水线前，请先把 seed task 放到 `seeds/<seed_id>/`。Seed 内容默认被 git 忽略；如需提交，必须显式覆盖或调整该 ignore 规则。
 
 ## 快速开始
 
@@ -130,8 +129,7 @@ scripts/taskgen.sh pipeline <seed_id> --openai
 scripts/taskgen.sh run phase1 <seed_id> --openai
 ```
 
-对于模型 phase，`--model` 和 `--effort` 会覆盖 `model.json`。Pipeline 的
-`--force` 会重跑已通过验证的 phase，`--continue-on-error` 会在一个 idea 失败后继续处理后续 ideas。
+对于模型 phase，`--model` 和 `--effort` 会覆盖 `model.json`。Pipeline 的 `--force` 会重跑已通过验证的 phase，`--continue-on-error` 会在一个 idea 失败后继续处理后续 ideas。
 
 ## 流水线
 
@@ -253,8 +251,7 @@ low, medium, high, xhigh, max
 cp scripts/env_init.example.sh scripts/env_init.sh
 ```
 
-该 example 默认连接 OpenRouter 的 Anthropic-compatible endpoint。设置
-`OPENROUTER_API_KEY`；如使用其他 provider，则调整其中的 Anthropic 环境变量。不要把真实 secrets 写入提交文档或日志。
+该 example 默认连接 OpenRouter 的 Anthropic-compatible endpoint。设置 `OPENROUTER_API_KEY`；如使用其他 provider，则调整其中的 Anthropic 环境变量。不要把真实 secrets 写入提交文档或日志。
 
 ### OpenAI-compatible 后端
 
@@ -264,8 +261,7 @@ cp scripts/env_init.example.sh scripts/env_init.sh
 cp scripts/env_openai_init.example.sh scripts/env_openai_init.sh
 ```
 
-将 `OPENAI_BASE_URL` 设为 provider 的 `/v1` API base，并填写
-`OPENAI_API_KEY`。当前 LiteLLM 路径要求 provider 支持 `POST /v1/responses`。模型可使用该 API 接受的任意名称，并会原样用于 Claude Code 的主模型、默认模型、subagent 模型和 LiteLLM 公开模型名。两个本地环境文件都会被 git 忽略。
+将 `OPENAI_BASE_URL` 设为 provider 的 `/v1` API base，并填写 `OPENAI_API_KEY`。当前 LiteLLM 路径要求 provider 支持 `POST /v1/responses`。模型可使用该 API 接受的任意名称，并会原样用于 Claude Code 的主模型、默认模型、subagent 模型和 LiteLLM 公开模型名。两个本地环境文件都会被 git 忽略。
 
 `model.json` 中的 `openai` 值只在传入 `--openai` 时选用；每次加载该文件时，整个对象都会被校验。可选的 `openai_phase_efforts` 可以按 phase 覆盖默认值，显式 `--model` 和 `--effort` 的优先级更高。LiteLLM 可能按模型能力调整 effort 档位。网关不会主动禁用 thinking；兼容性取决于所选模型、provider 和 LiteLLM 转换。完整运行 Claude Code 要求上游支持 streaming 和 tool calling。
 

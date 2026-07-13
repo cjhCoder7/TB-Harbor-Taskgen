@@ -34,6 +34,8 @@ SUPPORTED_PHASES = {
     "task-repair",
 }
 CLAUDE_DEFINITIONS_DIR = "cc-definitions"
+WORKTREE_GUARD_FILENAME = "taskgen-worktree-guard.py"
+WORKTREE_GUARD_SETTINGS_FILENAME = "settings.json"
 
 
 class WorkspaceOutputError(RuntimeError):
@@ -131,6 +133,44 @@ def write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
                 temporary.unlink()
             except OSError:
                 pass
+
+
+def install_worktree_guard(workspace: Path) -> tuple[Path, Path]:
+    """Install a per-run Claude hook that keeps subagents in ``workspace``."""
+
+    source = Path(__file__).with_name("worktree_guard.py")
+    unsafe_reason = unsafe_copy_source_reason(source)
+    if unsafe_reason:
+        raise SystemExit(f"cannot install Claude worktree guard: {unsafe_reason}")
+
+    workspace_claude = workspace / ".claude"
+    hook_path = workspace_claude / "hooks" / WORKTREE_GUARD_FILENAME
+    copy_path(source, hook_path)
+    hook_path.chmod(0o444)
+
+    hook_handler = {
+        "type": "command",
+        "command": sys.executable,
+        "args": [str(hook_path)],
+        "timeout": 5,
+    }
+    settings_path = workspace_claude / WORKTREE_GUARD_SETTINGS_FILENAME
+    write_json_atomic(
+        settings_path,
+        {
+            "hooks": {
+                "PreToolUse": [
+                    {
+                        "matcher": "Agent|Task|EnterWorktree",
+                        "hooks": [hook_handler],
+                    }
+                ],
+                "WorktreeCreate": [{"hooks": [hook_handler]}],
+            }
+        },
+    )
+    settings_path.chmod(0o600)
+    return settings_path, hook_path
 
 
 def require_safe_segment(value: str, label: str) -> None:
@@ -428,6 +468,7 @@ def prepare_workspace(
         settings_path = workspace_claude / settings_name
         if settings_path.exists():
             settings_path.unlink()
+    claude_settings_path, worktree_guard_path = install_worktree_guard(workspace)
 
     payload = {
         "phase": phase,
@@ -442,6 +483,8 @@ def prepare_workspace(
         "status_path": str(run_dir / "status.json"),
         "prompt_copy": str(prompt_copy),
         "workspace_prompt": str(workspace_prompt),
+        "claude_settings_path": str(claude_settings_path),
+        "worktree_guard_path": str(worktree_guard_path),
         "workspace_inputs": [workspace_rel_path for _, workspace_rel_path in required + optional],
         "generated_skill_packages": generated_skill_packages,
         "output_mappings": [
@@ -818,6 +861,8 @@ def write_status(
     stream_log: Path,
     cost_path: Path,
     claude_config_dir: Path,
+    claude_settings_path: Path,
+    worktree_guard_path: Path,
     synced_outputs: list[str],
     exit_code: int,
     timed_out: bool = False,
@@ -840,6 +885,8 @@ def write_status(
         "stream_log": str(stream_log),
         "cost_path": str(cost_path),
         "claude_config_dir": str(claude_config_dir),
+        "claude_settings_path": str(claude_settings_path),
+        "worktree_guard_path": str(worktree_guard_path),
         "raw_sessions_dir": str(claude_config_dir / "projects"),
         "synced_outputs": synced_outputs,
         "missing_outputs": list(missing_outputs or []),
@@ -924,6 +971,12 @@ def command_status(args: argparse.Namespace) -> int:
             stream_log=args.stream_log,
             cost_path=args.cost_path,
             claude_config_dir=args.claude_config_dir,
+            claude_settings_path=(
+                args.workspace_dir / ".claude" / WORKTREE_GUARD_SETTINGS_FILENAME
+            ),
+            worktree_guard_path=(
+                args.workspace_dir / ".claude/hooks" / WORKTREE_GUARD_FILENAME
+            ),
             synced_outputs=synced_outputs,
             exit_code=args.exit_code,
             timed_out=args.timed_out,

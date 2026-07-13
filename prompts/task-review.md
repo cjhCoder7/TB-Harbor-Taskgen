@@ -1,6 +1,6 @@
 # Task Review
 
-You are in an isolated workspace. Work only inside the current directory.
+You are already in an isolated workspace. Work only inside the current directory. Do not create or enter a Git worktree. If you invoke any subagent, omit the `Agent` tool's `isolation` field.
 
 Inputs:
 

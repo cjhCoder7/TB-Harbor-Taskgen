@@ -24,15 +24,9 @@
   <a href="README.zh-CN.md">简体中文</a>
 </p>
 
-TB-Harbor-Taskgen is a local workflow for turning one read-only Terminal-Bench
-Harbor seed task into multiple synthetic TB3 task candidates. Claude Code is the
-agent for generation and review, using either the default Claude backend or an
-OpenAI-compatible backend through LiteLLM. The pipeline injects curated external
-knowledge as task-specific Claude Code skills, then gates generated tasks with
-Harbor oracle/nop checks before moving them into accepted or rejected outputs.
+TB-Harbor-Taskgen is a local workflow for turning one read-only Terminal-Bench Harbor seed task into multiple synthetic TB3 task candidates. Claude Code is the agent for generation and review, using either the default Claude backend or an OpenAI-compatible backend through LiteLLM. The pipeline injects curated external knowledge as task-specific Claude Code skills, then gates generated tasks with Harbor oracle/nop checks before moving them into accepted or rejected outputs.
 
-For implementation details, see the
-[developer guide](docs/TB_HARBOR_TASKGEN_MVP_SPEC.md).
+For implementation details, see the [developer guide](docs/TB_HARBOR_TASKGEN_MVP_SPEC.md).
 
 ## Contents
 
@@ -47,8 +41,7 @@ For implementation details, see the
 
 ## Why This Exists
 
-High-quality Harbor tasks need more than a prompt and a generated directory.
-This project keeps the whole generation trail reproducible:
+High-quality Harbor tasks need more than a prompt and a generated directory. This project keeps the whole generation trail reproducible:
 
 - Brainstorm several ideas from a seed task.
 - Research external SkillNet knowledge and package it as task-specific skills.
@@ -64,17 +57,13 @@ The stable task id throughout the workflow is:
 <seed_id>__<idea_id>
 ```
 
-IDs use `[A-Za-z0-9._-]+`, cannot contain the reserved `__` separator, and are
-limited to 128 characters for seeds and 120 for ideas.
+IDs use `[A-Za-z0-9._-]+`, cannot contain the reserved `__` separator, and are limited to 128 characters for seeds and 120 for ideas.
 
-The repository does not include seed data. Add seed tasks under
-`seeds/<seed_id>/` before running the pipeline. Seed contents are ignored by
-default; committing them requires explicitly overriding or changing that rule.
+The repository does not include seed data. Add seed tasks under `seeds/<seed_id>/` before running the pipeline. Seed contents are ignored by default; committing them requires explicitly overriding or changing that rule.
 
 ## Quick Start
 
-Prerequisites are POSIX/Linux, Python 3.10+, Docker, `uv`, and a Claude Code
-binary. Claude Code remains the agent in both backend modes.
+Prerequisites are POSIX/Linux, Python 3.10+, Docker, `uv`, and a Claude Code binary. Claude Code remains the agent in both backend modes.
 
 Install the Python package in editable mode:
 
@@ -88,8 +77,7 @@ Install the local Harbor, SkillNet, and LiteLLM tools with the `uv`-based helper
 scripts/tool_init.sh
 ```
 
-Before the first model-backed run, finish the binary and provider setup under
-[Configuration](#configuration).
+Before the first model-backed run, finish the binary and provider setup under [Configuration](#configuration).
 
 Check the available phases:
 
@@ -134,17 +122,14 @@ Validate a finalized task:
 scripts/taskgen.sh validate phase7 <seed_id> --idea-id <idea_id> --json
 ```
 
-To use an OpenAI-compatible backend, complete the
-[provider setup](#openai-compatible-backend), then add `--openai`:
+To use an OpenAI-compatible backend, complete the [provider setup](#openai-compatible-backend), then add `--openai`:
 
 ```bash
 scripts/taskgen.sh pipeline <seed_id> --openai
 scripts/taskgen.sh run phase1 <seed_id> --openai
 ```
 
-For model-backed phases, `--model` and `--effort` override `model.json`.
-Pipeline option `--force` reruns already-valid phases, while
-`--continue-on-error` continues with later ideas after one fails.
+For model-backed phases, `--model` and `--effort` override `model.json`. Pipeline option `--force` reruns already-valid phases, while `--continue-on-error` continues with later ideas after one fails.
 
 ## Pipeline
 
@@ -191,13 +176,11 @@ flowchart LR
 └── pyproject.toml
 ```
 
-`scripts/taskgen.sh` loads the selected local provider environment, sets
-`PYTHONPATH=src`, and delegates to the Python package.
+`scripts/taskgen.sh` loads the selected local provider environment, sets `PYTHONPATH=src`, and delegates to the Python package.
 
 ## Configuration
 
-`model.json` controls the default Claude and OpenAI-compatible model settings,
-timeouts, effort levels, and optionally the Claude Code binary:
+`model.json` controls the default Claude and OpenAI-compatible model settings, timeouts, effort levels, and optionally the Claude Code binary:
 
 ```json
 {
@@ -233,51 +216,28 @@ timeouts, effort levels, and optionally the Claude Code binary:
 
 ### Runtime and timeouts
 
-`claude_code_path` points to the local Claude Code executable under
-`cc-binary/`. Keep this relative path aligned with the binary available on the
-machine that runs the pipeline. The downloaded executable is not committed.
+`claude_code_path` points to the local Claude Code executable under `cc-binary/`. Keep this relative path aligned with the binary available on the machine that runs the pipeline. The downloaded executable is not committed.
 
-`claude_code_timeout_sec` is the per-run Claude Code timeout in seconds. It
-must be positive; the default value `1800` limits each run to 30 minutes. When
-the limit is reached, the runner terminates that Claude Code process group and
-records exit code `124` with `timed_out: true` in the session status. Process
-group cleanup applies to the project's POSIX/Linux runtime.
+`claude_code_timeout_sec` is the per-run Claude Code timeout in seconds. It must be positive; the default value `1800` limits each run to 30 minutes. When the limit is reached, the runner terminates that Claude Code process group and records exit code `124` with `timed_out: true` in the session status. Process group cleanup applies to the project's POSIX/Linux runtime.
 
-`claude_code_phase_timeouts_sec` optionally overrides that fallback for named
-phases. Its keys use the same canonical phase names and aliases as
-`phase_efforts`, and every value must be a positive finite number. The shipped
-configuration gives phase3 generation and phase6 repair `10800` seconds (three
-hours), while all other Claude phases retain the 30-minute global fallback.
+`claude_code_phase_timeouts_sec` optionally overrides that fallback for named phases. Its keys use the same canonical phase names and aliases as `phase_efforts`, and every value must be a positive finite number. The shipped configuration gives phase3 generation and phase6 repair `10800` seconds (three hours), while all other Claude phases retain the 30-minute global fallback.
 
-`harbor_check_timeout_sec` is the supervisor timeout for each Harbor oracle or
-nop check. The default `10800` seconds leaves headroom above the generated
-task's normal two-hour agent limit while preventing a stuck Harbor or Docker
-process from waiting forever.
+`harbor_check_timeout_sec` is the supervisor timeout for each Harbor oracle or nop check. The default `10800` seconds leaves headroom above the generated task's normal two-hour agent limit while preventing a stuck Harbor or Docker process from waiting forever.
 
-The optional early Harbor oracle and nop checks in the phase3 and phase6
-prompts honor `HARBOR_BIN` and are each capped at 900 seconds. These checks are
-best-effort feedback for Claude; phase4 remains the authoritative validation.
-Phase4 resolves Harbor from `HARBOR_BIN` first, then from `harbor` on `PATH`.
+The optional early Harbor oracle and nop checks in the phase3 and phase6 prompts honor `HARBOR_BIN` and are each capped at 900 seconds. These checks are best-effort feedback for Claude; phase4 remains the authoritative validation. Phase4 resolves Harbor from `HARBOR_BIN` first, then from `harbor` on `PATH`.
 
-To download the Claude Code binary into a specific directory, change
-`CLAUDE_BIN_DIR` to the target location:
+To download the Claude Code binary into a specific directory, change `CLAUDE_BIN_DIR` to the target location:
 
 ```bash
 CLAUDE_VERSION=2.1.169 CLAUDE_PLATFORM=linux-x64 CLAUDE_BIN_DIR=cc-binary
 mkdir -p "$CLAUDE_BIN_DIR" && curl -fsSL "https://downloads.claude.ai/claude-code-releases/${CLAUDE_VERSION}/${CLAUDE_PLATFORM}/claude" -o "$CLAUDE_BIN_DIR/claude-${CLAUDE_VERSION}-${CLAUDE_PLATFORM}" && chmod +x "$CLAUDE_BIN_DIR/claude-${CLAUDE_VERSION}-${CLAUDE_PLATFORM}"
 ```
 
-If you downloaded the binary to a non-default path, update `claude_code_path` in
-`model.json` to match. `CLAUDE_PLATFORM` must match the machine that runs the
-pipeline; common values include `linux-x64`, `linux-arm64`, `linux-x64-musl`,
-and `linux-arm64-musl`.
+If you downloaded the binary to a non-default path, update `claude_code_path` in `model.json` to match. `CLAUDE_PLATFORM` must match the machine that runs the pipeline; common values include `linux-x64`, `linux-arm64`, `linux-x64-musl`, and `linux-arm64-musl`.
 
 ### Claude backend
 
-Without `--openai`, model resolution is `--model` then `default_model`; effort
-resolution is `--effort`, the matching `phase_efforts` entry, then
-`default_effort`. The CLI accepts these Claude Code effort values in both
-backend modes:
+Without `--openai`, model resolution is `--model` then `default_model`; effort resolution is `--effort`, the matching `phase_efforts` entry, then `default_effort`. The CLI accepts these Claude Code effort values in both backend modes:
 
 ```text
 low, medium, high, xhigh, max
@@ -289,9 +249,7 @@ Create local Claude-backend credentials from the example:
 cp scripts/env_init.example.sh scripts/env_init.sh
 ```
 
-The example targets OpenRouter's Anthropic-compatible endpoint. Set
-`OPENROUTER_API_KEY`, or adjust its Anthropic environment variables for another
-provider. Keep real secrets out of committed documentation and logs.
+The example targets OpenRouter's Anthropic-compatible endpoint. Set `OPENROUTER_API_KEY`, or adjust its Anthropic environment variables for another provider. Keep real secrets out of committed documentation and logs.
 
 ### OpenAI-compatible backend
 
@@ -301,29 +259,13 @@ Create the separate local provider file:
 cp scripts/env_openai_init.example.sh scripts/env_openai_init.sh
 ```
 
-Set `OPENAI_BASE_URL` to the provider's `/v1` API base and set
-`OPENAI_API_KEY`. The provider must support `POST /v1/responses` for the current
-LiteLLM route. Set any model name accepted by that API; it is passed through
-unchanged to Claude Code's main/default/subagent model settings and LiteLLM's
-public model name. Both local environment files are ignored by git.
+Set `OPENAI_BASE_URL` to the provider's `/v1` API base and set `OPENAI_API_KEY`. The provider must support `POST /v1/responses` for the current LiteLLM route. Set any model name accepted by that API; it is passed through unchanged to Claude Code's main/default/subagent model settings and LiteLLM's public model name. Both local environment files are ignored by git.
 
-The `openai` values in `model.json` are selected only with `--openai`; whenever
-the file is loaded, the whole object is validated. Optional
-`openai_phase_efforts` entries override the OpenAI default by phase; explicit
-`--model` and `--effort` arguments take precedence. LiteLLM may normalize the
-selected effort for the model. The gateway does not disable thinking;
-compatibility depends on the selected model, provider, and LiteLLM translation.
-Full Claude Code operation requires streaming and tool calling.
+The `openai` values in `model.json` are selected only with `--openai`; whenever the file is loaded, the whole object is validated. Optional `openai_phase_efforts` entries override the OpenAI default by phase; explicit `--model` and `--effort` arguments take precedence. LiteLLM may normalize the selected effort for the model. The gateway does not disable thinking; compatibility depends on the selected model, provider, and LiteLLM translation. Full Claude Code operation requires streaming and tool calling.
 
-A non-dry-run Claude-backed `run ... --openai` starts one temporary loopback
-LiteLLM proxy. `pipeline --openai` shares one proxy across phases 1, 2, 3, 5,
-and 6; completion, failure, or interruption stops it. Dry runs do not start the
-proxy. Only model transport changes: skills, subagents, and permitted Bash
-tools remain Claude Code features. The project uses LiteLLM's standard
-Anthropic Messages translation.
+A non-dry-run Claude-backed `run ... --openai` starts one temporary loopback LiteLLM proxy. `pipeline --openai` shares one proxy across phases 1, 2, 3, 5, and 6; completion, failure, or interruption stops it. Dry runs do not start the proxy. Only model transport changes: skills, subagents, and permitted Bash tools remain Claude Code features. The project uses LiteLLM's standard Anthropic Messages translation.
 
-`cost.json` still records token usage in this mode, but its dollar total is a
-Claude Code estimate rather than provider billing.
+`cost.json` still records token usage in this mode, but its dollar total is a Claude Code estimate rather than provider billing.
 
 ## Artifacts
 
@@ -349,14 +291,9 @@ Clean intermediate run artifacts with:
 scripts/clean-intermediate.sh --apply
 ```
 
-Cleanup preserves the append-only `runs/task-manifest.jsonl`; use
-`--drop-manifest` only when audit history should also be removed. It refuses to
-run during an active pipeline unless recovery explicitly requires
-`--force-active`.
+Cleanup preserves the append-only `runs/task-manifest.jsonl`; use `--drop-manifest` only when audit history should also be removed. It refuses to run during an active pipeline unless recovery explicitly requires `--force-active`.
 
-Pending recovery journals also block cleanup; `--discard-transactions` is the
-destructive override. Symlinked containers or ancestors are rejected. If a
-target itself is a symlink, only the link is removed.
+Pending recovery journals also block cleanup; `--discard-transactions` is the destructive override. Symlinked containers or ancestors are rejected. If a target itself is a symlink, only the link is removed.
 
 ## Development
 

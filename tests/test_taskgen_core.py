@@ -16,6 +16,7 @@ from unittest.mock import MagicMock, call, patch
 
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
+WORKTREE_GUARD_SCRIPT = SRC / "taskgen/claude/worktree_guard.py"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
@@ -152,6 +153,12 @@ def fake_claude_runner_fixture(
     prompt_copy.write_text("prompt", encoding="utf-8")
     claude_config_dir = run_dir / "claude-config"
     claude_config_dir.mkdir()
+    workspace_claude = workspace_dir / ".claude"
+    workspace_claude.mkdir()
+    claude_settings_path = workspace_claude / "settings.json"
+    claude_settings_path.write_text("{}\n", encoding="utf-8")
+    worktree_guard_path = workspace_claude / "worktree-guard.py"
+    worktree_guard_path.write_text("", encoding="utf-8")
     (root / "model.json").write_text(
         json.dumps({"claude_code_timeout_sec": timeout_sec}),
         encoding="utf-8",
@@ -165,6 +172,8 @@ def fake_claude_runner_fixture(
         "status_path": run_dir / "status.json",
         "prompt_copy": prompt_copy,
         "workspace_prompt": workspace_dir / "prompt.md",
+        "claude_settings_path": claude_settings_path,
+        "worktree_guard_path": worktree_guard_path,
     }
     args = SimpleNamespace(
         phase="seed-brainstorm",
@@ -415,6 +424,9 @@ class ClaudeRunnerTests(unittest.TestCase):
         self.assertIn("Bash(*grep -R / *)", command)
         self.assertIn("Bash(*rg --files / *)", command)
         self.assertIn("Bash(*locate *)", command)
+        self.assertIn("Bash(git worktree *)", command)
+        self.assertIn("Bash(* git worktree *)", command)
+        self.assertIn("EnterWorktree", command)
         self.assertLess(command.index("--disallowedTools"), command.index("--print"))
 
     def test_run_claude_passes_phase_timeout_override_to_subprocess(self) -> None:
@@ -449,6 +461,14 @@ class ClaudeRunnerTests(unittest.TestCase):
         process.wait.assert_called_once_with(timeout=10800.0)
         self.assertIs(write_status.call_args.kwargs["timed_out"], False)
         self.assertEqual(write_status.call_args.kwargs["timeout_sec"], 10800.0)
+        self.assertEqual(
+            write_status.call_args.kwargs["claude_settings_path"],
+            workspace_payload["claude_settings_path"],
+        )
+        self.assertEqual(
+            write_status.call_args.kwargs["worktree_guard_path"],
+            workspace_payload["worktree_guard_path"],
+        )
 
     def test_run_claude_records_timeout_without_syncing_outputs(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -619,6 +639,134 @@ class ClaudeRunnerTests(unittest.TestCase):
                 )
             finally:
                 force_kill_processes(pid_paths)
+
+
+class ClaudeWorktreeGuardTests(unittest.TestCase):
+    def run_guard(self, hook_input: object) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [sys.executable, str(WORKTREE_GUARD_SCRIPT)],
+            input=json.dumps(hook_input),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+
+    def test_agent_worktree_isolation_is_removed_without_changing_other_input(self) -> None:
+        tool_input = {
+            "isolation": "worktree",
+            "description": "research",
+            "model": "sonnet",
+            "run_in_background": False,
+            "subagent_type": "seed-brainstormer",
+            "future_field": {"nested": [1, 2, 3]},
+        }
+        result = self.run_guard(
+            {
+                "hook_event_name": "PreToolUse",
+                "tool_name": "Agent",
+                "tool_input": tool_input,
+            }
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stderr, "")
+        payload = json.loads(result.stdout)
+        output = payload["hookSpecificOutput"]
+        self.assertEqual(output["hookEventName"], "PreToolUse")
+        self.assertEqual(output["permissionDecision"], "allow")
+        expected_input = dict(tool_input)
+        expected_input.pop("isolation")
+        self.assertEqual(output["updatedInput"], expected_input)
+        self.assertIn("existing isolated workspace", output["additionalContext"])
+
+    def test_legacy_task_isolation_is_also_removed(self) -> None:
+        result = self.run_guard(
+            {
+                "hook_event_name": "PreToolUse",
+                "tool_name": "Task",
+                "tool_input": {"isolation": "worktree", "prompt": "work"},
+            }
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        output = json.loads(result.stdout)["hookSpecificOutput"]
+        self.assertEqual(output["updatedInput"], {"prompt": "work"})
+
+    def test_agent_without_isolation_and_unrelated_tools_are_unchanged(self) -> None:
+        for tool_name, tool_input in (
+            ("Agent", {"description": "research"}),
+            ("Bash", {"command": "pwd"}),
+        ):
+            with self.subTest(tool_name=tool_name):
+                result = self.run_guard(
+                    {
+                        "hook_event_name": "PreToolUse",
+                        "tool_name": tool_name,
+                        "tool_input": tool_input,
+                    }
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout, "")
+                self.assertEqual(result.stderr, "")
+
+    def test_enter_worktree_is_denied(self) -> None:
+        result = self.run_guard(
+            {
+                "hook_event_name": "PreToolUse",
+                "tool_name": "EnterWorktree",
+                "tool_input": {},
+            }
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        output = json.loads(result.stdout)["hookSpecificOutput"]
+        self.assertEqual(output["permissionDecision"], "deny")
+        self.assertIn("worktree is disabled", output["permissionDecisionReason"])
+
+    def test_worktree_create_fails_closed(self) -> None:
+        result = self.run_guard(
+            {
+                "hook_event_name": "WorktreeCreate",
+                "name": "agent-test",
+            }
+        )
+
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stdout, "")
+        self.assertIn("blocks Claude Code worktree creation", result.stderr)
+
+    def test_malformed_hook_input_fails_closed(self) -> None:
+        result = subprocess.run(
+            [sys.executable, str(WORKTREE_GUARD_SCRIPT)],
+            input="not-json",
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stdout, "")
+        self.assertIn("rejected malformed hook input", result.stderr)
+
+    def test_incomplete_hook_input_fails_closed(self) -> None:
+        inputs = (
+            {},
+            {"hook_event_name": "Unknown"},
+            {"hook_event_name": "PreToolUse"},
+            {
+                "hook_event_name": "PreToolUse",
+                "tool_name": "Agent",
+                "tool_input": [],
+            },
+        )
+        for hook_input in inputs:
+            with self.subTest(hook_input=hook_input):
+                result = self.run_guard(hook_input)
+                self.assertEqual(result.returncode, 2)
+                self.assertEqual(result.stdout, "")
+                self.assertIn("rejected malformed hook input", result.stderr)
 
 
 class PipelineTests(unittest.TestCase):
@@ -816,10 +964,66 @@ class ClaudeWorkspaceTests(unittest.TestCase):
             payload = prepare_workspace(project, "seed-brainstorm", "seed-a", prompt, "run-1")
             workspace = Path(str(payload["workspace_dir"]))
             runtime = Path(str(payload["claude_config_dir"]))
+            settings_path = Path(str(payload["claude_settings_path"]))
+            guard_path = Path(str(payload["worktree_guard_path"]))
 
             self.assertTrue((workspace / ".claude/agents/seed-brainstormer.md").is_file())
             self.assertTrue((workspace / ".claude/skills/demo-skill/SKILL.md").is_file())
             self.assertFalse((runtime / "skills").exists())
+            self.assertEqual(settings_path, workspace / ".claude/settings.json")
+            self.assertEqual(guard_path.parent, workspace / ".claude/hooks")
+            self.assertTrue(settings_path.is_file())
+            self.assertTrue(guard_path.is_file())
+            self.assertFalse(settings_path.is_symlink())
+            self.assertFalse(guard_path.is_symlink())
+            self.assertEqual(settings_path.stat().st_mode & 0o022, 0)
+            self.assertEqual(guard_path.stat().st_mode & 0o022, 0)
+            self.assertFalse((workspace / ".claude/settings.local.json").exists())
+            self.assertFalse((project / ".claude").exists())
+
+            settings = json.loads(settings_path.read_text(encoding="utf-8"))
+            pre_tool_use = settings["hooks"]["PreToolUse"]
+            self.assertEqual(pre_tool_use[0]["matcher"], "Agent|Task|EnterWorktree")
+            handler = pre_tool_use[0]["hooks"][0]
+            self.assertEqual(handler["command"], sys.executable)
+            self.assertEqual(handler["args"], [str(guard_path)])
+            self.assertEqual(
+                settings["hooks"]["WorktreeCreate"][0]["hooks"][0],
+                handler,
+            )
+
+    def test_workspace_guard_exec_form_handles_special_characters_in_path(self) -> None:
+        with tempfile.TemporaryDirectory() as project_tmp:
+            project = Path(project_tmp) / "project with spaces [guard]"
+            (project / "prompts").mkdir(parents=True)
+            prompt = project / "prompts/seed-brainstorm.md"
+            prompt.write_text("prompt", encoding="utf-8")
+            (project / "seeds/seed-a").mkdir(parents=True)
+
+            payload = prepare_workspace(project, "seed-brainstorm", "seed-a", prompt, "run-1")
+            workspace = Path(str(payload["workspace_dir"]))
+            settings_path = Path(str(payload["claude_settings_path"]))
+            settings = json.loads(settings_path.read_text(encoding="utf-8"))
+            handler = settings["hooks"]["PreToolUse"][0]["hooks"][0]
+            result = subprocess.run(
+                [handler["command"], *handler["args"]],
+                input=json.dumps(
+                    {
+                        "hook_event_name": "PreToolUse",
+                        "tool_name": "Agent",
+                        "tool_input": {"isolation": "worktree", "prompt": "work"},
+                    }
+                ),
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                cwd=workspace,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            output = json.loads(result.stdout)["hookSpecificOutput"]
+            self.assertEqual(output["updatedInput"], {"prompt": "work"})
 
     def test_skillnet_research_outputs_seed_directory(self) -> None:
         self.assertEqual(

@@ -48,6 +48,9 @@ DISALLOWED_TOOL_ARGS = (
     "Bash(*rg / *)",
     "Bash(*rg --files / *)",
     "Bash(*locate *)",
+    "Bash(git worktree *)",
+    "Bash(* git worktree *)",
+    "EnterWorktree",
 )
 TIMEOUT_EXIT_CODE = 124
 OUTPUT_SYNC_EXIT_CODE = 1
@@ -260,6 +263,8 @@ def run_prepared_claude_logged(
     status_path = Path(str(workspace_payload["status_path"]))
     prompt_copy = Path(str(workspace_payload["prompt_copy"]))
     workspace_prompt = Path(str(workspace_payload["workspace_prompt"]))
+    claude_settings_path = Path(str(workspace_payload["claude_settings_path"]))
+    worktree_guard_path = Path(str(workspace_payload["worktree_guard_path"]))
 
     prompt = prompt_copy.read_text(encoding="utf-8")
     config = load_model_config(root)
@@ -328,6 +333,8 @@ def run_prepared_claude_logged(
         stream_log=stream_log,
         cost_path=cost_path,
         claude_config_dir=claude_config_dir,
+        claude_settings_path=claude_settings_path,
+        worktree_guard_path=worktree_guard_path,
         synced_outputs=synced_outputs,
         exit_code=exit_code,
         timed_out=timed_out,
