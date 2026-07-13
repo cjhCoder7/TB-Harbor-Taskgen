@@ -68,10 +68,13 @@ IDs use `[A-Za-z0-9._-]+`, cannot contain the reserved `__` separator, and are
 limited to 128 characters for seeds and 120 for ideas.
 
 The repository does not include seed data. Add seed tasks under
-`seeds/<seed_id>/` before running the pipeline, and decide separately whether
-those inputs should be committed.
+`seeds/<seed_id>/` before running the pipeline. Seed contents are ignored by
+default; committing them requires explicitly overriding or changing that rule.
 
 ## Quick Start
+
+Prerequisites are POSIX/Linux, Python 3.10+, Docker, `uv`, and a Claude Code
+binary. Claude Code remains the agent in both backend modes.
 
 Install the Python package in editable mode:
 
@@ -85,10 +88,20 @@ Install the local Harbor, SkillNet, and LiteLLM tools with the `uv`-based helper
 scripts/tool_init.sh
 ```
 
+Before the first model-backed run, finish the binary and provider setup under
+[Configuration](#configuration).
+
 Check the available phases:
 
 ```bash
 scripts/taskgen.sh phases
+```
+
+Run one phase or inspect what follows phase1:
+
+```bash
+scripts/taskgen.sh run phase1 <seed_id>
+scripts/taskgen.sh next <seed_id>
 ```
 
 Run the full pipeline for every idea under a seed:
@@ -128,6 +141,10 @@ To use an OpenAI-compatible backend, complete the
 scripts/taskgen.sh pipeline <seed_id> --openai
 scripts/taskgen.sh run phase1 <seed_id> --openai
 ```
+
+For model-backed phases, `--model` and `--effort` override `model.json`.
+Pipeline option `--force` reruns already-valid phases, while
+`--continue-on-error` continues with later ideas after one fails.
 
 ## Pipeline
 
@@ -201,11 +218,20 @@ timeouts, effort levels, and optionally the Claude Code binary:
     "phase6": "high"
   },
   "openai": {
-    "openai_default_model": "<model-supported-by-your-url>",
-    "openai_default_effort": "xhigh"
+    "openai_default_model": "gpt-5.4",
+    "openai_default_effort": "xhigh",
+    "openai_phase_efforts": {
+      "phase1": "xhigh",
+      "phase2": "xhigh",
+      "phase3": "xhigh",
+      "phase5": "xhigh",
+      "phase6": "xhigh"
+    }
   }
 }
 ```
+
+### Runtime and timeouts
 
 `claude_code_path` points to the local Claude Code executable under
 `cc-binary/`. Keep this relative path aligned with the binary available on the
@@ -246,20 +272,26 @@ If you downloaded the binary to a non-default path, update `claude_code_path` in
 pipeline; common values include `linux-x64`, `linux-arm64`, `linux-x64-musl`,
 and `linux-arm64-musl`.
 
-Supported effort values:
+### Claude backend
+
+Without `--openai`, model resolution is `--model` then `default_model`; effort
+resolution is `--effort`, the matching `phase_efforts` entry, then
+`default_effort`. The CLI accepts these Claude Code effort values in both
+backend modes:
 
 ```text
 low, medium, high, xhigh, max
 ```
 
-For the default backend, create local provider credentials from the example:
+Create local Claude-backend credentials from the example:
 
 ```bash
 cp scripts/env_init.example.sh scripts/env_init.sh
 ```
 
-Then fill `scripts/env_init.sh` locally. Keep real secrets out of committed
-documentation and logs.
+The example targets OpenRouter's Anthropic-compatible endpoint. Set
+`OPENROUTER_API_KEY`, or adjust its Anthropic environment variables for another
+provider. Keep real secrets out of committed documentation and logs.
 
 ### OpenAI-compatible backend
 
@@ -272,20 +304,23 @@ cp scripts/env_openai_init.example.sh scripts/env_openai_init.sh
 Set `OPENAI_BASE_URL` to the provider's `/v1` API base and set
 `OPENAI_API_KEY`. The provider must support `POST /v1/responses` for the current
 LiteLLM route. Set any model name accepted by that API; it is passed through
-unchanged. Both local environment files are ignored by git.
+unchanged to Claude Code's main/default/subagent model settings and LiteLLM's
+public model name. Both local environment files are ignored by git.
 
-The `openai` settings in `model.json` apply only with `--openai`; optional
-`openai_phase_efforts` values override the OpenAI default by phase, while
-explicit `--model` and `--effort` arguments take precedence. Full Claude Code
-operation requires streaming and tool calling from the selected model and
-provider. The gateway does not disable thinking; the selected effort passes
-through Claude Code and may be normalized by LiteLLM to match model support.
+The `openai` values in `model.json` are selected only with `--openai`; whenever
+the file is loaded, the whole object is validated. Optional
+`openai_phase_efforts` entries override the OpenAI default by phase; explicit
+`--model` and `--effort` arguments take precedence. LiteLLM may normalize the
+selected effort for the model. The gateway does not disable thinking;
+compatibility depends on the selected model, provider, and LiteLLM translation.
+Full Claude Code operation requires streaming and tool calling.
 
-Each `run --openai` starts a temporary loopback LiteLLM proxy. A
-`pipeline --openai` shares one proxy across its Claude-backed phases and stops
-it on completion, failure, or interruption. Only the model transport changes:
-skills, subagents, and Bash remain Claude Code features. The project uses
-LiteLLM's standard Anthropic Messages translation.
+A non-dry-run Claude-backed `run ... --openai` starts one temporary loopback
+LiteLLM proxy. `pipeline --openai` shares one proxy across phases 1, 2, 3, 5,
+and 6; completion, failure, or interruption stops it. Dry runs do not start the
+proxy. Only model transport changes: skills, subagents, and permitted Bash
+tools remain Claude Code features. The project uses LiteLLM's standard
+Anthropic Messages translation.
 
 `cost.json` still records token usage in this mode, but its dollar total is a
 Claude Code estimate rather than provider billing.
@@ -303,8 +338,8 @@ runs/brainstorm/<seed_id>/                  # phase1 output
 runs/skillnet/<seed_id>/                    # phase2 output
 runs/oracle-nop-check/<task_id>/            # phase4 Harbor logs and status
 runs/reviews/<task_id>/                     # phase5 review JSON and Markdown
-runs/claude-sessions/<phase>/<subject>/     # Claude logs and status
-runs/workspace/<phase>/<subject>/           # isolated Claude workspaces
+runs/claude-sessions/<phase>/<subject>/<run_id>/ # claude-code.txt, cost.json, status.json
+runs/workspace/<phase>/<subject>/<run_id>/  # isolated Claude workspace
 runs/task-manifest.jsonl                    # append-only audit manifest
 ```
 
@@ -314,14 +349,14 @@ Clean intermediate run artifacts with:
 scripts/clean-intermediate.sh --apply
 ```
 
-Cleanup preserves the append-only `runs/task-manifest.jsonl` by default and
-refuses to run while a pipeline session is active. Use `--drop-manifest` only
-when audit history should also be removed; `--force-active` bypasses the active
-run guard and should be reserved for recovery. Pending crash-recovery journals
-also block cleanup; `--discard-transactions` is the explicit destructive override.
-Both listing and deletion refuse symlinked cleanup containers or symlinked
-ancestors. If a cleanup target itself is a symlink, only that link is removed;
-the linked directory is never traversed or deleted.
+Cleanup preserves the append-only `runs/task-manifest.jsonl`; use
+`--drop-manifest` only when audit history should also be removed. It refuses to
+run during an active pipeline unless recovery explicitly requires
+`--force-active`.
+
+Pending recovery journals also block cleanup; `--discard-transactions` is the
+destructive override. Symlinked containers or ancestors are rejected. If a
+target itself is a symlink, only the link is removed.
 
 ## Development
 

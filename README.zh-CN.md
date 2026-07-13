@@ -60,9 +60,11 @@ TB-Harbor-Taskgen 是一个从只读 Terminal-Bench Harbor seed task 生成 TB3 
 ID 使用 `[A-Za-z0-9._-]+`，不能包含保留分隔符 `__`；seed 最长 128 个字符，idea 最长 120 个字符。
 
 仓库当前不包含 seed 数据。运行流水线前，请先把 seed task 放到
-`seeds/<seed_id>/`，并按项目需要决定这些输入是否提交。
+`seeds/<seed_id>/`。Seed 内容默认被 git 忽略；如需提交，必须显式覆盖或调整该 ignore 规则。
 
 ## 快速开始
+
+前置条件是 POSIX/Linux、Python 3.10+、Docker、`uv` 和 Claude Code binary。两种后端模式都继续使用 Claude Code 作为 agent。
 
 以 editable 模式安装 Python package：
 
@@ -76,10 +78,19 @@ python3 -m pip install -e .
 scripts/tool_init.sh
 ```
 
+首次运行模型 phase 前，先完成[配置](#配置)中的 binary 和 provider 设置。
+
 查看可用 phases：
 
 ```bash
 scripts/taskgen.sh phases
+```
+
+运行单个 phase，或查看 phase1 完成后的下一步：
+
+```bash
+scripts/taskgen.sh run phase1 <seed_id>
+scripts/taskgen.sh next <seed_id>
 ```
 
 对一个 seed 的所有 ideas 运行完整流水线：
@@ -118,6 +129,9 @@ scripts/taskgen.sh validate phase7 <seed_id> --idea-id <idea_id> --json
 scripts/taskgen.sh pipeline <seed_id> --openai
 scripts/taskgen.sh run phase1 <seed_id> --openai
 ```
+
+对于模型 phase，`--model` 和 `--effort` 会覆盖 `model.json`。Pipeline 的
+`--force` 会重跑已通过验证的 phase，`--continue-on-error` 会在一个 idea 失败后继续处理后续 ideas。
 
 ## 流水线
 
@@ -189,11 +203,20 @@ flowchart LR
     "phase6": "high"
   },
   "openai": {
-    "openai_default_model": "<model-supported-by-your-url>",
-    "openai_default_effort": "xhigh"
+    "openai_default_model": "gpt-5.4",
+    "openai_default_effort": "xhigh",
+    "openai_phase_efforts": {
+      "phase1": "xhigh",
+      "phase2": "xhigh",
+      "phase3": "xhigh",
+      "phase5": "xhigh",
+      "phase6": "xhigh"
+    }
   }
 }
 ```
+
+### 运行时和超时
 
 `claude_code_path` 指向 `cc-binary/` 下的本地 Claude Code 可执行文件。请保持这个相对路径与运行机器上的实际 binary 一致；下载的可执行文件不提交到仓库。
 
@@ -216,19 +239,22 @@ mkdir -p "$CLAUDE_BIN_DIR" && curl -fsSL "https://downloads.claude.ai/claude-cod
 
 如果下载到了非默认路径，请同步更新 `model.json` 里的 `claude_code_path`。`CLAUDE_PLATFORM` 需要和运行机器一致；常见值包括 `linux-x64`、`linux-arm64`、`linux-x64-musl` 和 `linux-arm64-musl`。
 
-支持的 effort values：
+### Claude 后端
+
+未传入 `--openai` 时，模型依次从 `--model`、`default_model` 解析；effort 依次从 `--effort`、匹配的 `phase_efforts` 和 `default_effort` 解析。两种后端模式的 CLI 都接受以下 Claude Code effort values：
 
 ```text
 low, medium, high, xhigh, max
 ```
 
-从 example 创建默认后端的本地 provider credentials：
+从 example 创建 Claude 后端的本地 credentials：
 
 ```bash
 cp scripts/env_init.example.sh scripts/env_init.sh
 ```
 
-然后只在本机填写 `scripts/env_init.sh`。不要把真实 secrets 写入提交文档或日志。
+该 example 默认连接 OpenRouter 的 Anthropic-compatible endpoint。设置
+`OPENROUTER_API_KEY`；如使用其他 provider，则调整其中的 Anthropic 环境变量。不要把真实 secrets 写入提交文档或日志。
 
 ### OpenAI-compatible 后端
 
@@ -239,13 +265,11 @@ cp scripts/env_openai_init.example.sh scripts/env_openai_init.sh
 ```
 
 将 `OPENAI_BASE_URL` 设为 provider 的 `/v1` API base，并填写
-`OPENAI_API_KEY`。当前 LiteLLM 路径要求 provider 支持 `POST /v1/responses`。模型可使用该 API 接受的任意名称，并会原样传递。两个本地环境文件都会被 git 忽略。
+`OPENAI_API_KEY`。当前 LiteLLM 路径要求 provider 支持 `POST /v1/responses`。模型可使用该 API 接受的任意名称，并会原样用于 Claude Code 的主模型、默认模型、subagent 模型和 LiteLLM 公开模型名。两个本地环境文件都会被 git 忽略。
 
-`model.json` 中的 `openai` 配置只在传入 `--openai` 时生效；可选的
-`openai_phase_efforts` 可以按 phase 覆盖默认值，显式 `--model` 和
-`--effort` 的优先级更高。完整运行 Claude Code 要求所选模型和 provider 支持 streaming 与 tool calling。网关不会主动禁用 thinking；所选 effort 会经 Claude Code 传递，并可能由 LiteLLM 按模型能力调整。
+`model.json` 中的 `openai` 值只在传入 `--openai` 时选用；每次加载该文件时，整个对象都会被校验。可选的 `openai_phase_efforts` 可以按 phase 覆盖默认值，显式 `--model` 和 `--effort` 的优先级更高。LiteLLM 可能按模型能力调整 effort 档位。网关不会主动禁用 thinking；兼容性取决于所选模型、provider 和 LiteLLM 转换。完整运行 Claude Code 要求上游支持 streaming 和 tool calling。
 
-`run --openai` 会启动一个临时回环 LiteLLM proxy；`pipeline --openai` 在所有 Claude-backed phases 间复用一个 proxy，并在正常结束、失败或中断时停止。该模式只改变模型传输链路，skills、subagents 和 Bash 仍是 Claude Code 的能力。项目使用 LiteLLM 标准的 Anthropic Messages 转换。
+非 dry-run 的 Claude-backed `run ... --openai` 会启动一个临时回环 LiteLLM proxy。`pipeline --openai` 在 phase1、phase2、phase3、phase5 和 phase6 间复用一个 proxy，正常结束、失败或中断时都会停止；dry-run 不会启动 proxy。该模式只改变模型传输链路，skills、subagents 和允许的 Bash 工具仍是 Claude Code 的能力。项目使用 LiteLLM 标准的 Anthropic Messages 转换。
 
 该模式仍会在 `cost.json` 中记录 token usage，但金额是 Claude Code 的估算值，不是 provider 账单。
 
@@ -262,8 +286,8 @@ runs/brainstorm/<seed_id>/                  # phase1 output
 runs/skillnet/<seed_id>/                    # phase2 output
 runs/oracle-nop-check/<task_id>/            # phase4 Harbor logs and status
 runs/reviews/<task_id>/                     # phase5 review JSON and Markdown
-runs/claude-sessions/<phase>/<subject>/     # Claude logs and status
-runs/workspace/<phase>/<subject>/           # isolated Claude workspaces
+runs/claude-sessions/<phase>/<subject>/<run_id>/ # claude-code.txt、cost.json、status.json
+runs/workspace/<phase>/<subject>/<run_id>/  # isolated Claude workspace
 runs/task-manifest.jsonl                    # append-only audit manifest
 ```
 
@@ -273,7 +297,9 @@ runs/task-manifest.jsonl                    # append-only audit manifest
 scripts/clean-intermediate.sh --apply
 ```
 
-清理命令默认保留 append-only 的 `runs/task-manifest.jsonl`，并在检测到活跃流水线时拒绝执行。仅在确实需要删除审计历史时使用 `--drop-manifest`；`--force-active` 会绕过活跃运行保护，只应用于故障恢复。若存在待恢复的事务日志，清理同样会拒绝；只有显式传入破坏性的 `--discard-transactions` 才会丢弃它们。无论只列出还是实际删除，命令都会拒绝 symlink cleanup container 或带 symlink ancestor 的目标；若目标本身是 symlink，则只删除链接，不会遍历或删除链接指向的目录。
+清理命令默认保留 append-only 的 `runs/task-manifest.jsonl`；仅在确实需要删除审计历史时使用 `--drop-manifest`。检测到活跃流水线时会拒绝执行，`--force-active` 只应用于故障恢复。
+
+待恢复的事务日志也会阻止清理；`--discard-transactions` 是破坏性覆盖。命令会拒绝 symlink container 或带 symlink ancestor 的目标；若目标本身是 symlink，则只删除该链接。
 
 ## 开发
 

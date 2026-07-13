@@ -95,14 +95,20 @@ OpenAI-compatible model settings:
     "phase6": "high"
   },
   "openai": {
-    "openai_default_model": "provider-model-name",
+    "openai_default_model": "gpt-5.4",
     "openai_default_effort": "xhigh",
-    "openai_phase_efforts": {}
+    "openai_phase_efforts": {
+      "phase1": "xhigh",
+      "phase2": "xhigh",
+      "phase3": "xhigh",
+      "phase5": "xhigh",
+      "phase6": "xhigh"
+    }
   }
 }
 ```
 
-Supported efforts are `low`, `medium`, `high`, `xhigh`, and `max`.
+Both backend configurations accept `low`, `medium`, `high`, `xhigh`, and `max`.
 
 `claude_code_path` is resolved relative to the project root when it is not
 absolute. The referenced binary is local and is ignored by git. If this field is
@@ -129,11 +135,15 @@ typos cannot silently fall back to defaults.
 
 `phase_efforts` accepts canonical phase keys and aliases defined in
 `src/taskgen/config.py`. Prefer canonical keys (`phase1` through `phase7`) for
-new config.
+new config. For non-OpenAI runs, model resolution is `--model` then
+`default_model`; effort resolution is `--effort`, the matching `phase_efforts`
+entry, then `default_effort`.
 
-The optional `openai` object applies only with `--openai`. An explicit `--model`
-takes precedence over `openai_default_model`, and the selected name is used
-unchanged. Effort resolves from explicit `--effort`, then
+The optional `openai` values are selected only with `--openai`, but the object
+is strictly validated whenever `model.json` is loaded. An explicit `--model`
+takes precedence over `openai_default_model`. The selected name is used
+unchanged for Claude Code's main, default, and subagent models and as LiteLLM's
+public model name. Effort resolves from explicit `--effort`, then
 `openai_phase_efforts`, then `openai_default_effort`; it never falls back to the
 Claude settings. Missing required values and unknown keys fail before a
 model-backed phase starts.
@@ -238,8 +248,9 @@ Upstream credentials are available to LiteLLM but not to Claude Code or its
 tools. The gateway uses LiteLLM's standard Anthropic Messages translation.
 It does not disable thinking; the selected effort passes through Claude Code
 and may be normalized by LiteLLM to match model support. Skills, subagents, and
-Bash remain Claude Code features; full operation requires upstream streaming
-and tool calling support.
+permitted Bash tools remain Claude Code features. Thinking compatibility
+depends on the selected model, provider, and LiteLLM translation. Full operation
+requires upstream streaming and tool calling.
 
 ## 6. Artifact Layout
 
@@ -266,9 +277,9 @@ generated/accepted/<task_id>/
 generated/rejected/<task_id>/
 ```
 
-`runs/` and `generated/` contents are ignored by git except skeleton
-`.gitkeep` files. `seeds/` is an input directory; decide separately whether
-your seed data should be committed.
+`runs/`, `generated/`, and `seeds/` contents are ignored by git except skeleton
+`.gitkeep` files. Committing seed inputs requires explicitly overriding or
+changing that ignore rule.
 
 ## 7. Claude Workspace Model
 
@@ -328,7 +339,9 @@ Claude runs with `--verbose`, `--output-format=stream-json`,
 `--permission-mode bypassPermissions`, `--print`, `CLAUDE_CONFIG_DIR` scoped to
 the run directory, and `IS_SANDBOX=1`. On POSIX/Linux, the runner starts Claude
 in an isolated process group so a configured timeout, interrupt, or runner-side
-failure also stops its tool subprocesses.
+failure also stops its tool subprocesses. Bash remains available, but the runner
+blocks broad `find`, `grep`, and `rg` searches rooted at `/`, as well as
+`locate`.
 
 ## 8. Phase Contracts
 
@@ -360,7 +373,10 @@ include `idea_id`, `title`, `scenario`, `core_transfer`, `changed_dimensions`,
 `expected_artifacts`, `verifier_sketch`, `risk_notes`, `difficulty_profile`,
 and `skillnet_queries`.
 
-`difficulty_profile.minimum_independent_subskills` must be at least `2`.
+`changed_dimensions` must contain at least two distinct items.
+`difficulty_profile.minimum_independent_subskills` must be at least `2`, and
+`too_easy_antipatterns`, `hardening_levers`, and `fairness_bounds` must each be
+non-empty lists.
 
 Manifest event: `brainstormed`.
 
@@ -384,10 +400,11 @@ Statuses are `ready`, `partial`, `no_strong_match`, and `failed`.
 
 Skill package names must be path-safe and start with
 `taskgen-<idea_id>-`. `ready` requires 3-5 selected skills; `partial` requires
-1-5. `skill_summary.json` must include selected skills, notes, implementation
-risks, `recommended_direction`, and `difficulty_hardening` with minimum
-complexity, too-easy risks, hardening recommendations, and do-not-simplify
-guidance.
+1-5. The `skill_summary.json` summary must include `selected_skills`,
+`tooling_notes`, `environment_notes`, `verifier_notes`, `implementation_risks`,
+`recommended_direction`, and `difficulty_hardening`. The latter requires a
+non-empty string `minimum_complexity_contract` and non-empty lists
+`too_easy_risks`, `recommended_hardening`, and `do_not_simplify`.
 
 Manifest event: `skillnet_done`.
 
@@ -500,7 +517,7 @@ Inputs:
 
 - Working task.
 - Review directory.
-- Optional oracle/nop directory copied into the Claude workspace.
+- Phase4 oracle/nop directory copied into the Claude workspace.
 - `prompts/task-repair.md`.
 
 Claude must sync `output/task` back to
@@ -522,17 +539,21 @@ Phase7 requires:
 - for `rejected`, phase4 status is well formed and reviewable, but it may have
   failed the formal pass condition.
 
-For `ready`, the working task is copied to:
+For `ready`, the working task is finalized at:
 
 ```text
 generated/accepted/<task_id>/
 ```
 
-For `rejected`, the working task is copied to:
+For `rejected`, the working task is finalized at:
 
 ```text
 generated/rejected/<task_id>/
 ```
+
+After success, the working source is removed and only the destination matching
+the current decision remains; an opposite accepted/rejected destination is
+removed.
 
 The final task is first copied and validated in a sibling staging directory,
 then atomically switched into place. The previous destination can be restored
@@ -608,9 +629,9 @@ non-directory ancestor and does not follow directory symlinks while locating
 Python caches. A cleanup target that is itself a symlink is only unlinked; its
 external target is left untouched.
 
-Current ignore rules keep local credentials, runtime artifacts, generated task
-outputs, Python caches, and the local Claude binary out of git. `model.json`
-still points to the expected local Claude binary path.
+Current ignore rules keep local credentials, seed inputs, runtime artifacts,
+generated task outputs, Python caches, and the local Claude binary out of git.
+`model.json` still points to the expected local Claude binary path.
 
 ## 11. Development Checks
 
