@@ -24,8 +24,10 @@ generated TB3 Harbor task candidates. The workflow is phase-based:
 6. Repair it when review asks for modification.
 7. Move the task to accepted or rejected output.
 
-The pipeline is local. Claude Code is used for phases that need language-model
-work; deterministic phases run in Python and Harbor.
+The pipeline is local. Claude Code is the agent for phases that need
+language-model work. By default it calls the configured Anthropic-compatible
+backend; `--openai` instead routes it through a temporary LiteLLM gateway to an
+OpenAI-compatible backend. Deterministic phases run in Python and Harbor.
 
 ## 2. Repository Map
 
@@ -34,6 +36,7 @@ work; deterministic phases run in Python and Harbor.
 | `src/taskgen/cli.py` | Top-level CLI, phase registry, full pipeline orchestration. |
 | `src/taskgen/phases/` | Phase-specific run and validation modules. |
 | `src/taskgen/claude/` | Claude workspace preparation, execution wrapper, and cost parsing. |
+| `src/taskgen/openai_gateway.py` | Temporary LiteLLM lifecycle and OpenAI-compatible protocol bridge. |
 | `src/taskgen/harbor/oracle_nop.py` | Harbor oracle/nop check runner and status writer. |
 | `src/taskgen/maintenance/clean_intermediate.py` | Cleanup for generated run artifacts. |
 | `prompts/` | Prompt templates rendered into `runs/prompts/`. |
@@ -70,7 +73,8 @@ task directories, and manifest events.
 ### `model.json`
 
 `model.json` configures the Claude binary, Claude and Harbor supervisor
-timeouts, default model, default effort, and per-phase effort levels:
+timeouts, the default Claude-compatible model settings, and the optional
+OpenAI-compatible model settings:
 
 ```json
 {
@@ -89,6 +93,11 @@ timeouts, default model, default effort, and per-phase effort levels:
     "phase3": "max",
     "phase5": "high",
     "phase6": "high"
+  },
+  "openai": {
+    "openai_default_model": "provider-model-name",
+    "openai_default_effort": "xhigh",
+    "openai_phase_efforts": {}
   }
 }
 ```
@@ -122,19 +131,28 @@ typos cannot silently fall back to defaults.
 `src/taskgen/config.py`. Prefer canonical keys (`phase1` through `phase7`) for
 new config.
 
+The optional `openai` object applies only with `--openai`. An explicit `--model`
+takes precedence over `openai_default_model`, and the selected name is used
+unchanged. Effort resolves from explicit `--effort`, then
+`openai_phase_efforts`, then `openai_default_effort`; it never falls back to the
+Claude settings. Missing required values and unknown keys fail before a
+model-backed phase starts.
+
 ### Shell Scripts
 
 | Script | Behavior |
 | --- | --- |
-| `scripts/taskgen.sh` | Runs `python3 -m taskgen.cli`. |
+| `scripts/taskgen.sh` | Selects the local environment and runs `python3 -m taskgen.cli`. |
 | `scripts/run-claude-logged.sh` | Runs the Claude wrapper and records session metadata. |
 | `scripts/run-harbor-oracle-nop.sh` | Runs Harbor oracle/nop checks. |
 | `scripts/clean-intermediate.sh` | Cleans intermediate runtime artifacts. |
-| `scripts/tool_init.sh` | Installs `harbor==0.13.2` and `skillnet-ai==0.0.18` with `uv tool install`. |
+| `scripts/tool_init.sh` | Installs `harbor==0.13.2`, `skillnet-ai==0.0.18`, and `litellm[proxy]==1.91.1` with `uv tool install`. |
 
-Each shell script sources `scripts/env_init.sh` when present and sets
-`PYTHONPATH` to include `src/`. `scripts/env_init.sh` is local-only and ignored;
-start from `scripts/env_init.example.sh`.
+When present, `scripts/taskgen.sh` sources `scripts/env_init.sh` by default or
+`scripts/env_openai_init.sh` with `--openai`. Both files are local-only and
+ignored by git; create them from the corresponding `.example.sh` file. Nested
+wrappers preserve an active gateway environment, and all wrappers add `src/` to
+`PYTHONPATH`.
 
 ## 5. CLI
 
@@ -157,7 +175,8 @@ scripts/taskgen.sh next <seed_id>
 ### Single Phase Commands
 
 ```bash
-scripts/taskgen.sh run <phase> <seed_id> [--idea-id <idea_id>] [--dry-run]
+scripts/taskgen.sh run <phase> <seed_id> [--idea-id <idea_id>] [--dry-run] \
+  [--model <model>] [--effort <effort>] [--openai]
 scripts/taskgen.sh validate <phase> <seed_id> [--idea-id <idea_id>] [--json]
 ```
 
@@ -166,7 +185,9 @@ scripts/taskgen.sh validate <phase> <seed_id> [--idea-id <idea_id>] [--json]
 validate an exact brainstorm idea count.
 
 Claude-backed phases accept `--model` and `--effort`: `phase1`, `phase2`,
-`phase3`, `phase5`, `phase6`.
+`phase3`, `phase5`, `phase6`. Those same phases accept `--openai`; deterministic
+phases reject it. A dry run resolves and prints the OpenAI-compatible model and
+effort but does not start LiteLLM.
 
 ### Full Pipeline
 
@@ -179,7 +200,8 @@ scripts/taskgen.sh pipeline <seed_id> \
   [--continue-on-error] \
   [--dry-run] \
   [--model <model>] \
-  [--effort <effort>]
+  [--effort <effort>] \
+  [--openai]
 ```
 
 The pipeline runs phase1 and phase2 first, then processes either the requested
@@ -191,6 +213,33 @@ runs phase6 and then forces phase4 and phase5 again until the review decision is
 `ready`, `rejected`, or the repair budget is exhausted. A dry run returns
 non-zero when phase1 would need to run and no explicit `--idea-id` is available,
 because the remaining per-idea plan cannot yet be determined.
+
+### OpenAI-Compatible Claude Code Backend
+
+`--openai` does not replace Claude Code as the agent. It changes only the model
+transport used by Claude Code:
+
+```text
+Claude Code -> Anthropic /v1/messages -> temporary LiteLLM
+            -> upstream OpenAI-compatible /v1/responses
+```
+
+Set `OPENAI_BASE_URL` and `OPENAI_API_KEY` in
+`scripts/env_openai_init.sh`. The upstream must support the
+`POST /v1/responses` route shown above.
+
+`run --openai` starts one loopback gateway for the phase. `pipeline --openai`
+and `run-all --openai` share one gateway across all Claude-backed phases and
+repair rounds. Phases start after local gateway readiness checks; upstream
+connectivity is exercised by the first model request. The gateway is stopped
+after completion, failure, or interruption.
+
+Upstream credentials are available to LiteLLM but not to Claude Code or its
+tools. The gateway uses LiteLLM's standard Anthropic Messages translation.
+It does not disable thinking; the selected effort passes through Claude Code
+and may be normalized by LiteLLM to match model support. Skills, subagents, and
+Bash remain Claude Code features; full operation requires upstream streaming
+and tool calling support.
 
 ## 6. Artifact Layout
 
@@ -271,6 +320,9 @@ enrichment is bounded by a 30-second total deadline, 100 generation IDs, and a
 `TASKGEN_OPENROUTER_DEADLINE_SECONDS`, `TASKGEN_OPENROUTER_MAX_GENERATIONS`, and
 `TASKGEN_OPENROUTER_QUERY_TIMEOUT_SECONDS`. Provider cost replaces the stream
 cost only when every generation has a finite, non-negative cost.
+
+In OpenAI-compatible mode, token usage is still recorded, but dollar totals are
+Claude Code estimates rather than provider billing.
 
 Claude runs with `--verbose`, `--output-format=stream-json`,
 `--permission-mode bypassPermissions`, `--print`, `CLAUDE_CONFIG_DIR` scoped to

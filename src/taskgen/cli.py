@@ -24,7 +24,12 @@ from taskgen.common import (
     validate_idea_identifier,
     validate_seed_identifier,
 )
-from taskgen.config import EFFORT_LEVELS
+from taskgen.config import (
+    EFFORT_LEVELS,
+    resolve_openai_effort_level,
+    resolve_openai_model_name,
+)
+from taskgen.openai_gateway import OpenAIGatewayError, openai_gateway
 
 
 @dataclass(frozen=True)
@@ -289,6 +294,23 @@ def command_display(command: list[str]) -> str:
     return " ".join(shlex.quote(part) for part in command)
 
 
+def phase_runtime_options(
+    root: Path,
+    args: argparse.Namespace,
+    phase_name: str,
+) -> tuple[str | None, str | None]:
+    if not getattr(args, "openai", False):
+        return args.model, args.effort
+
+    phase = get_phase(phase_name)
+    if phase.key not in CLAUDE_RUN_PHASES:
+        raise SystemExit(f"{phase.key} does not accept --openai")
+    return (
+        resolve_openai_model_name(root, args.model),
+        resolve_openai_effort_level(root, args.effort, phase.key),
+    )
+
+
 def validate_phase_json(
     root: Path,
     phase_name: str,
@@ -445,6 +467,7 @@ def run_pipeline_idea(
         print(f"pipeline: phase7 {seed_id} --idea-id {idea_id} already finalized; skipping")
         return 0
 
+    phase3_model, phase3_effort = phase_runtime_options(root, args, "phase3")
     phase3 = run_or_skip_phase(
         root,
         "phase3",
@@ -452,8 +475,8 @@ def run_pipeline_idea(
         idea_id=idea_id,
         force=force_generation,
         dry_run=args.dry_run,
-        model=args.model,
-        effort=args.effort,
+        model=phase3_model,
+        effort=phase3_effort,
     )
     if phase3.exit_code != 0:
         return phase3.exit_code
@@ -482,6 +505,7 @@ def run_pipeline_idea(
                 "so review can drive phase6 repair"
             )
 
+        phase5_model, phase5_effort = phase_runtime_options(root, args, "phase5")
         phase5 = run_or_skip_phase(
             root,
             "phase5",
@@ -489,8 +513,8 @@ def run_pipeline_idea(
             idea_id=idea_id,
             force=force_dynamic or phase4.ran,
             dry_run=args.dry_run,
-            model=args.model,
-            effort=args.effort,
+            model=phase5_model,
+            effort=phase5_effort,
         )
         if phase5.exit_code != 0:
             return phase5.exit_code
@@ -529,6 +553,7 @@ def run_pipeline_idea(
             f"pipeline: entering phase6 repair round {repair_round}/{args.max_repairs} "
             f"for {seed_id} --idea-id {idea_id}"
         )
+        phase6_model, phase6_effort = phase_runtime_options(root, args, "phase6")
         phase6 = run_or_skip_phase(
             root,
             "phase6",
@@ -536,8 +561,8 @@ def run_pipeline_idea(
             idea_id=idea_id,
             force=True,
             dry_run=args.dry_run,
-            model=args.model,
-            effort=args.effort,
+            model=phase6_model,
+            effort=phase6_effort,
         )
         if phase6.exit_code != 0:
             return phase6.exit_code
@@ -545,8 +570,7 @@ def run_pipeline_idea(
         force_dynamic = True
 
 
-def _command_pipeline_with_activity_lock(args: argparse.Namespace) -> int:
-    root = project_root()
+def validate_pipeline_arguments(args: argparse.Namespace) -> None:
     if args.max_repairs < 0:
         raise SystemExit("--max-repairs must be >= 0")
     id_errors = validate_seed_identifier(args.seed_id)
@@ -554,6 +578,10 @@ def _command_pipeline_with_activity_lock(args: argparse.Namespace) -> int:
         id_errors.extend(validate_idea_identifier(args.idea_id))
     if id_errors:
         raise SystemExit("; ".join(id_errors))
+
+
+def _command_pipeline_with_activity_lock(args: argparse.Namespace) -> int:
+    root = project_root()
     phase1_count_mismatch = (
         args.idea_count is not None
         and not pipeline_phase1_count_matches(root, args.seed_id, args.idea_count)
@@ -564,27 +592,29 @@ def _command_pipeline_with_activity_lock(args: argparse.Namespace) -> int:
             "phase1 will run"
         )
 
+    phase1_model, phase1_effort = phase_runtime_options(root, args, "phase1")
     phase1 = run_or_skip_phase(
         root,
         "phase1",
         args.seed_id,
         force=args.force or phase1_count_mismatch,
         dry_run=args.dry_run,
-        model=args.model,
-        effort=args.effort,
+        model=phase1_model,
+        effort=phase1_effort,
         idea_count=args.idea_count,
     )
     if phase1.exit_code != 0:
         return phase1.exit_code
 
+    phase2_model, phase2_effort = phase_runtime_options(root, args, "phase2")
     phase2 = run_or_skip_phase(
         root,
         "phase2",
         args.seed_id,
         force=args.force or phase1.ran,
         dry_run=args.dry_run,
-        model=args.model,
-        effort=args.effort,
+        model=phase2_model,
+        effort=phase2_effort,
     )
     if phase2.exit_code != 0:
         return phase2.exit_code
@@ -633,8 +663,20 @@ def _command_pipeline_with_activity_lock(args: argparse.Namespace) -> int:
 
 
 def command_pipeline(args: argparse.Namespace) -> int:
-    with pipeline_activity_lock(project_root()):
-        return _command_pipeline_with_activity_lock(args)
+    root = project_root()
+    validate_pipeline_arguments(args)
+    with pipeline_activity_lock(root):
+        if not getattr(args, "openai", False) or args.dry_run:
+            return _command_pipeline_with_activity_lock(args)
+
+        model = resolve_openai_model_name(root, args.model)
+        for phase_name in sorted(CLAUDE_RUN_PHASES):
+            resolve_openai_effort_level(root, args.effort, phase_name)
+        try:
+            with openai_gateway(model):
+                return _command_pipeline_with_activity_lock(args)
+        except OpenAIGatewayError as exc:
+            raise SystemExit(f"openai gateway: {exc}") from None
 
 
 def command_phases(_: argparse.Namespace) -> int:
@@ -675,31 +717,27 @@ def command_command(args: argparse.Namespace) -> int:
 def command_run(args: argparse.Namespace) -> int:
     root = project_root()
     phase = get_phase(args.phase)
-    phase_module = require_phase_module(phase)
+    model, effort = phase_runtime_options(root, args, phase.key)
+    command = build_phase_process_command(
+        phase,
+        "run",
+        args.seed_id,
+        idea_id=args.idea_id,
+        idea_count=args.idea_count,
+        dry_run=args.dry_run,
+        model=model,
+        effort=effort,
+    )
 
-    command = [sys.executable, "-m", phase_module, "run", args.seed_id]
-    if phase.key in IDEA_SCOPED_PHASES:
-        if not args.idea_id:
-            raise SystemExit(f"{phase.key} requires --idea-id")
-        command.extend(["--idea-id", args.idea_id])
-    elif args.idea_id:
-        raise SystemExit(f"{phase.key} does not accept --idea-id")
-    if args.idea_count is not None:
-        if phase.key != "phase1":
-            raise SystemExit(f"{phase.key} does not accept --idea-count")
-        command.extend(["--idea-count", str(args.idea_count)])
-    if args.dry_run:
-        command.append("--dry-run")
-    if args.model:
-        if phase.key not in CLAUDE_RUN_PHASES:
-            raise SystemExit(f"{phase.key} does not accept --model")
-        command.extend(["--model", args.model])
-    if args.effort:
-        if phase.key not in CLAUDE_RUN_PHASES:
-            raise SystemExit(f"{phase.key} does not accept --effort")
-        command.extend(["--effort", args.effort])
+    if not getattr(args, "openai", False) or args.dry_run:
+        return subprocess.run(command, cwd=root, env=python_env(root), check=False).returncode
 
-    return subprocess.run(command, cwd=root, env=python_env(root), check=False).returncode
+    assert model is not None
+    try:
+        with openai_gateway(model):
+            return subprocess.run(command, cwd=root, env=python_env(root), check=False).returncode
+    except OpenAIGatewayError as exc:
+        raise SystemExit(f"openai gateway: {exc}") from None
 
 
 def command_validate(args: argparse.Namespace) -> int:
@@ -788,11 +826,28 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Render the phase prompt and print the command without running Claude or validation.",
     )
-    run.add_argument("--model", help="Claude model to use. Defaults to model.json default_model when omitted.")
+    run.add_argument(
+        "--model",
+        help=(
+            "Model name to use. Defaults to model.json default_model normally, or "
+            "openai.openai_default_model with --openai."
+        ),
+    )
     run.add_argument(
         "--effort",
         choices=EFFORT_LEVELS,
-        help="Claude Code effort level for this run. Defaults to model.json phase_efforts for the phase, then default_effort.",
+        help=(
+            "Claude Code effort level for this run. Uses the matching normal or "
+            "openai phase/default effort configuration when omitted."
+        ),
+    )
+    run.add_argument(
+        "--openai",
+        action="store_true",
+        help=(
+            "Route this Claude Code phase through a temporary LiteLLM service to "
+            "an OpenAI-compatible API."
+        ),
     )
     run.set_defaults(func=command_run)
 
@@ -829,11 +884,22 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Print the phase commands that would run without executing them.",
     )
-    pipeline.add_argument("--model", help="Claude model to use for Claude-backed phases.")
+    pipeline.add_argument(
+        "--model",
+        help="Model name to use for Claude-backed phases, including with --openai.",
+    )
     pipeline.add_argument(
         "--effort",
         choices=EFFORT_LEVELS,
         help="Claude Code effort level for Claude-backed phases.",
+    )
+    pipeline.add_argument(
+        "--openai",
+        action="store_true",
+        help=(
+            "Route all Claude Code phases through one temporary LiteLLM service to "
+            "an OpenAI-compatible API."
+        ),
     )
     pipeline.set_defaults(func=command_pipeline)
 

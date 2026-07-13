@@ -24,7 +24,7 @@
   <strong>简体中文</strong>
 </p>
 
-TB-Harbor-Taskgen 是一个本地任务生成流水线。它从一个只读 Terminal-Bench Harbor seed task 出发，生成多个合成的 TB3 task candidates。流水线使用 Claude Code 完成创意生成和评审，把外部知识整理成 task-specific Claude Code skills 注入生成 workspace，再通过 Harbor oracle/nop 检查作为动态 gate，最后把任务整理到 accepted 或 rejected 产物目录。
+TB-Harbor-Taskgen 是一个从只读 Terminal-Bench Harbor seed task 生成 TB3 task candidates 的本地流水线。Claude Code 负责生成和评审，既可以使用默认 Claude 后端，也可以通过 LiteLLM 连接 OpenAI-compatible 后端。流水线把外部知识整理成 task-specific Claude Code skills 注入 workspace，再通过 Harbor oracle/nop 检查筛选任务，最后整理到 accepted 或 rejected 产物目录。
 
 实现细节见 [开发者指南](docs/TB_HARBOR_TASKGEN_MVP_SPEC.zh-CN.md)。
 
@@ -70,7 +70,7 @@ ID 使用 `[A-Za-z0-9._-]+`，不能包含保留分隔符 `__`；seed 最长 128
 python3 -m pip install -e .
 ```
 
-如果本机还没有安装 Harbor 或 SkillNet，可以使用基于 `uv` 的 helper 安装本地工具依赖：
+使用基于 `uv` 的 helper 安装本地 Harbor、SkillNet 和 LiteLLM 工具：
 
 ```bash
 scripts/tool_init.sh
@@ -110,6 +110,13 @@ scripts/taskgen.sh pipeline <seed_id> --idea-id <idea_id> --dry-run
 
 ```bash
 scripts/taskgen.sh validate phase7 <seed_id> --idea-id <idea_id> --json
+```
+
+如需使用 OpenAI-compatible 后端，先完成[后端配置](#openai-compatible-后端)，再加入 `--openai`：
+
+```bash
+scripts/taskgen.sh pipeline <seed_id> --openai
+scripts/taskgen.sh run phase1 <seed_id> --openai
 ```
 
 ## 流水线
@@ -153,15 +160,15 @@ flowchart LR
 ├── seeds/                 # 只读输入 seed tasks
 ├── src/taskgen/           # Python 实现
 ├── tests/                 # 本地单元测试
-├── model.json             # Claude model、binary、timeout 和 per-phase effort config
+├── model.json             # Claude/OpenAI-compatible model、timeout 和 effort config
 └── pyproject.toml
 ```
 
-`scripts/` 下的 shell entry points 会在存在时 source `scripts/env_init.sh`，设置 `PYTHONPATH=src`，然后转发到 Python package。
+`scripts/taskgen.sh` 会加载所选后端的本地环境、设置 `PYTHONPATH=src`，再转发到 Python package。
 
 ## 配置
 
-`model.json` 控制默认 Claude Code model、timeout、effort levels，并可选地指定 Claude Code binary：
+`model.json` 控制默认 Claude 和 OpenAI-compatible model 配置、timeout、effort levels，并可选地指定 Claude Code binary：
 
 ```json
 {
@@ -180,6 +187,10 @@ flowchart LR
     "phase3": "max",
     "phase5": "high",
     "phase6": "high"
+  },
+  "openai": {
+    "openai_default_model": "<model-supported-by-your-url>",
+    "openai_default_effort": "xhigh"
   }
 }
 ```
@@ -193,6 +204,8 @@ flowchart LR
 `harbor_check_timeout_sec` 是每次 Harbor oracle 或 nop 检查的外层超时时间。默认值 `10800` 秒高于生成任务通常使用的两小时 agent 时限，同时避免 Harbor、Docker 或其子进程永久挂起。
 
 phase3 和 phase6 提示词中的可选早期 Harbor oracle/nop 检查会使用 `HARBOR_BIN`，并且每次最多运行 900 秒。这些检查只为 Claude 提供尽早反馈，phase4 仍是正式验证。
+
+Phase4 会先从 `HARBOR_BIN` 解析 Harbor，再回退到 `PATH` 上的 `harbor`。
 
 如果需要把 Claude Code binary 下载到指定目录，可以把 `CLAUDE_BIN_DIR` 改成目标目录：
 
@@ -209,7 +222,7 @@ mkdir -p "$CLAUDE_BIN_DIR" && curl -fsSL "https://downloads.claude.ai/claude-cod
 low, medium, high, xhigh, max
 ```
 
-从 example 文件创建本地 provider credentials：
+从 example 创建默认后端的本地 provider credentials：
 
 ```bash
 cp scripts/env_init.example.sh scripts/env_init.sh
@@ -217,7 +230,24 @@ cp scripts/env_init.example.sh scripts/env_init.sh
 
 然后只在本机填写 `scripts/env_init.sh`。不要把真实 secrets 写入提交文档或日志。
 
-Phase4 会先从 `HARBOR_BIN` 解析 Harbor，再回退到 `PATH` 上的 `harbor`。
+### OpenAI-compatible 后端
+
+创建单独的本地 provider 文件：
+
+```bash
+cp scripts/env_openai_init.example.sh scripts/env_openai_init.sh
+```
+
+将 `OPENAI_BASE_URL` 设为 provider 的 `/v1` API base，并填写
+`OPENAI_API_KEY`。当前 LiteLLM 路径要求 provider 支持 `POST /v1/responses`。模型可使用该 API 接受的任意名称，并会原样传递。两个本地环境文件都会被 git 忽略。
+
+`model.json` 中的 `openai` 配置只在传入 `--openai` 时生效；可选的
+`openai_phase_efforts` 可以按 phase 覆盖默认值，显式 `--model` 和
+`--effort` 的优先级更高。完整运行 Claude Code 要求所选模型和 provider 支持 streaming 与 tool calling。网关不会主动禁用 thinking；所选 effort 会经 Claude Code 传递，并可能由 LiteLLM 按模型能力调整。
+
+`run --openai` 会启动一个临时回环 LiteLLM proxy；`pipeline --openai` 在所有 Claude-backed phases 间复用一个 proxy，并在正常结束、失败或中断时停止。该模式只改变模型传输链路，skills、subagents 和 Bash 仍是 Claude Code 的能力。项目使用 LiteLLM 标准的 Anthropic Messages 转换。
+
+该模式仍会在 `cost.json` 中记录 token usage，但金额是 Claude Code 的估算值，不是 provider 账单。
 
 ## 产物
 

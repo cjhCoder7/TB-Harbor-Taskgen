@@ -4,7 +4,7 @@ set -euo pipefail
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 project_root="$(cd "${script_dir}/.." && pwd)"
 
-if [[ -f "${script_dir}/env_init.sh" ]]; then
+if [[ "${TASKGEN_OPENAI_GATEWAY_ACTIVE:-}" != "1" && -f "${script_dir}/env_init.sh" ]]; then
   source "${script_dir}/env_init.sh"
 fi
 

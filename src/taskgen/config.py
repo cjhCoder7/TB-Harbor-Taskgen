@@ -23,6 +23,14 @@ MODEL_CONFIG_KEYS = frozenset(
         "claude_code_timeout_sec",
         "claude_code_phase_timeouts_sec",
         "harbor_check_timeout_sec",
+        "openai",
+    }
+)
+OPENAI_CONFIG_KEYS = frozenset(
+    {
+        "openai_default_model",
+        "openai_default_effort",
+        "openai_phase_efforts",
     }
 )
 PHASE_EFFORT_ALIASES = {
@@ -42,6 +50,13 @@ PHASE_EFFORT_KEYS = {
 
 
 @dataclass(frozen=True)
+class OpenAIConfig:
+    default_model: str | None = None
+    default_effort: str | None = None
+    phase_efforts: dict[str, str] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
 class ModelConfig:
     default_model: str | None = None
     default_effort: str | None = None
@@ -50,6 +65,7 @@ class ModelConfig:
     claude_code_timeout_sec: float = DEFAULT_CLAUDE_CODE_TIMEOUT_SEC
     claude_code_phase_timeouts_sec: dict[str, float] = field(default_factory=dict)
     harbor_check_timeout_sec: float = DEFAULT_HARBOR_CHECK_TIMEOUT_SEC
+    openai: OpenAIConfig | None = None
 
 
 def load_model_config(root: Path) -> ModelConfig:
@@ -82,6 +98,7 @@ def load_model_config(root: Path) -> ModelConfig:
     default_model = read_optional_non_empty_string(payload, "default_model", MODEL_CONFIG_FILENAME)
     default_effort = read_optional_non_empty_string(payload, "default_effort", MODEL_CONFIG_FILENAME)
     phase_efforts = read_phase_efforts(payload)
+    openai = read_openai_config(payload)
     claude_code_path = read_optional_non_empty_string(payload, "claude_code_path", MODEL_CONFIG_FILENAME)
     claude_code_timeout_sec = read_positive_number(
         payload,
@@ -108,6 +125,7 @@ def load_model_config(root: Path) -> ModelConfig:
         claude_code_timeout_sec=claude_code_timeout_sec,
         claude_code_phase_timeouts_sec=claude_code_phase_timeouts_sec,
         harbor_check_timeout_sec=harbor_check_timeout_sec,
+        openai=openai,
     )
 
 
@@ -139,34 +157,72 @@ def read_positive_number(
     return numeric_value
 
 
-def read_phase_efforts(payload: dict[str, Any]) -> dict[str, str]:
-    value = payload.get("phase_efforts")
+def read_effort_mapping(
+    payload: dict[str, Any],
+    key_name: str,
+    source: str,
+) -> dict[str, str]:
+    value = payload.get(key_name)
     if value is None:
         return {}
     if not isinstance(value, dict):
-        raise SystemExit(f"{MODEL_CONFIG_FILENAME}.phase_efforts must be an object when set")
+        raise SystemExit(f"{source}.{key_name} must be an object when set")
 
     phase_efforts: dict[str, str] = {}
     allowed_keys = ", ".join(sorted(PHASE_EFFORT_KEYS))
     allowed_efforts = ", ".join(EFFORT_LEVELS)
     for raw_key, raw_effort in value.items():
         if not isinstance(raw_key, str) or not raw_key.strip():
-            raise SystemExit(f"{MODEL_CONFIG_FILENAME}.phase_efforts keys must be non-empty strings")
+            raise SystemExit(f"{source}.{key_name} keys must be non-empty strings")
         key = raw_key.strip()
         if key not in PHASE_EFFORT_KEYS:
             raise SystemExit(
-                f"{MODEL_CONFIG_FILENAME}.phase_efforts has unknown phase key {key!r}; "
+                f"{source}.{key_name} has unknown phase key {key!r}; "
                 f"expected one of: {allowed_keys}"
             )
         if not isinstance(raw_effort, str) or not raw_effort.strip():
-            raise SystemExit(f"{MODEL_CONFIG_FILENAME}.phase_efforts.{key} must be a non-empty string")
+            raise SystemExit(f"{source}.{key_name}.{key} must be a non-empty string")
         effort = raw_effort.strip()
         if effort not in EFFORT_LEVELS:
             raise SystemExit(
-                f"{MODEL_CONFIG_FILENAME}.phase_efforts.{key} must be one of: {allowed_efforts}"
+                f"{source}.{key_name}.{key} must be one of: {allowed_efforts}"
             )
         phase_efforts[key] = effort
     return phase_efforts
+
+
+def read_phase_efforts(payload: dict[str, Any]) -> dict[str, str]:
+    return read_effort_mapping(payload, "phase_efforts", MODEL_CONFIG_FILENAME)
+
+
+def read_openai_config(payload: dict[str, Any]) -> OpenAIConfig | None:
+    value = payload.get("openai")
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise SystemExit(f"{MODEL_CONFIG_FILENAME}.openai must be an object when set")
+
+    unknown_keys = sorted(set(value) - OPENAI_CONFIG_KEYS)
+    if unknown_keys:
+        allowed = ", ".join(sorted(OPENAI_CONFIG_KEYS))
+        unknown = ", ".join(repr(key) for key in unknown_keys)
+        raise SystemExit(
+            f"{MODEL_CONFIG_FILENAME}.openai contains unknown key(s): {unknown}; "
+            f"allowed keys: {allowed}"
+        )
+
+    source = f"{MODEL_CONFIG_FILENAME}.openai"
+    default_model = read_optional_non_empty_string(value, "openai_default_model", source)
+    default_effort = read_optional_non_empty_string(value, "openai_default_effort", source)
+    if default_effort is not None and default_effort not in EFFORT_LEVELS:
+        allowed = ", ".join(EFFORT_LEVELS)
+        raise SystemExit(f"{source}.openai_default_effort must be one of: {allowed}")
+
+    return OpenAIConfig(
+        default_model=default_model,
+        default_effort=default_effort,
+        phase_efforts=read_effort_mapping(value, "openai_phase_efforts", source),
+    )
 
 
 def read_phase_timeouts(payload: dict[str, Any]) -> dict[str, float]:
@@ -234,6 +290,44 @@ def resolve_effort_level(root: Path, explicit_effort: str | None, phase: str | N
         if effort is not None:
             return effort
     return config.default_effort
+
+
+def resolve_openai_model_name(root: Path, explicit_model: str | None) -> str:
+    if explicit_model:
+        return explicit_model
+    openai_config = load_model_config(root).openai
+    if openai_config is None or openai_config.default_model is None:
+        raise SystemExit(
+            f"{MODEL_CONFIG_FILENAME}.openai.openai_default_model is required with "
+            "--openai unless --model is provided"
+        )
+    return openai_config.default_model
+
+
+def resolve_openai_effort_level(
+    root: Path,
+    explicit_effort: str | None,
+    phase: str | None = None,
+) -> str:
+    if explicit_effort:
+        return explicit_effort
+    openai_config = load_model_config(root).openai
+    if openai_config is None:
+        raise SystemExit(
+            f"{MODEL_CONFIG_FILENAME}.openai.openai_default_effort is required with "
+            "--openai unless --effort is provided"
+        )
+    for key in phase_effort_lookup_keys(phase):
+        effort = openai_config.phase_efforts.get(key)
+        if effort is not None:
+            return effort
+    if openai_config.default_effort is None:
+        raise SystemExit(
+            f"{MODEL_CONFIG_FILENAME}.openai has no effort configured for {phase or 'this run'}; "
+            f"set {MODEL_CONFIG_FILENAME}.openai.openai_default_effort, a matching "
+            "openai_phase_efforts value, or --effort"
+        )
+    return openai_config.default_effort
 
 
 def resolve_claude_code_path(root: Path) -> Path | None:

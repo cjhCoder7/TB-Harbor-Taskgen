@@ -25,8 +25,9 @@
 </p>
 
 TB-Harbor-Taskgen is a local workflow for turning one read-only Terminal-Bench
-Harbor seed task into multiple synthetic TB3 task candidates. The pipeline uses
-Claude Code for creative generation and review, injects curated external
+Harbor seed task into multiple synthetic TB3 task candidates. Claude Code is the
+agent for generation and review, using either the default Claude backend or an
+OpenAI-compatible backend through LiteLLM. The pipeline injects curated external
 knowledge as task-specific Claude Code skills, then gates generated tasks with
 Harbor oracle/nop checks before moving them into accepted or rejected outputs.
 
@@ -78,8 +79,7 @@ Install the Python package in editable mode:
 python3 -m pip install -e .
 ```
 
-If Harbor or SkillNet are not already installed, install the local tool
-dependencies with the `uv`-based helper:
+Install the local Harbor, SkillNet, and LiteLLM tools with the `uv`-based helper:
 
 ```bash
 scripts/tool_init.sh
@@ -119,6 +119,14 @@ Validate a finalized task:
 
 ```bash
 scripts/taskgen.sh validate phase7 <seed_id> --idea-id <idea_id> --json
+```
+
+To use an OpenAI-compatible backend, complete the
+[provider setup](#openai-compatible-backend), then add `--openai`:
+
+```bash
+scripts/taskgen.sh pipeline <seed_id> --openai
+scripts/taskgen.sh run phase1 <seed_id> --openai
 ```
 
 ## Pipeline
@@ -162,17 +170,17 @@ flowchart LR
 ├── seeds/                 # read-only input seed tasks
 ├── src/taskgen/           # Python implementation
 ├── tests/                 # local unit tests
-├── model.json             # Claude model, binary, timeout, and per-phase effort config
+├── model.json             # Claude/OpenAI-compatible model, timeout, and effort config
 └── pyproject.toml
 ```
 
-Shell entry points under `scripts/` source `scripts/env_init.sh` when it exists,
-set `PYTHONPATH=src`, and then delegate to the Python package.
+`scripts/taskgen.sh` loads the selected local provider environment, sets
+`PYTHONPATH=src`, and delegates to the Python package.
 
 ## Configuration
 
-`model.json` controls the default Claude Code model, timeout, effort levels,
-and optionally the Claude Code binary:
+`model.json` controls the default Claude and OpenAI-compatible model settings,
+timeouts, effort levels, and optionally the Claude Code binary:
 
 ```json
 {
@@ -191,6 +199,10 @@ and optionally the Claude Code binary:
     "phase3": "max",
     "phase5": "high",
     "phase6": "high"
+  },
+  "openai": {
+    "openai_default_model": "<model-supported-by-your-url>",
+    "openai_default_effort": "xhigh"
   }
 }
 ```
@@ -219,6 +231,7 @@ process from waiting forever.
 The optional early Harbor oracle and nop checks in the phase3 and phase6
 prompts honor `HARBOR_BIN` and are each capped at 900 seconds. These checks are
 best-effort feedback for Claude; phase4 remains the authoritative validation.
+Phase4 resolves Harbor from `HARBOR_BIN` first, then from `harbor` on `PATH`.
 
 To download the Claude Code binary into a specific directory, change
 `CLAUDE_BIN_DIR` to the target location:
@@ -239,7 +252,7 @@ Supported effort values:
 low, medium, high, xhigh, max
 ```
 
-Create local provider credentials from the example file:
+For the default backend, create local provider credentials from the example:
 
 ```bash
 cp scripts/env_init.example.sh scripts/env_init.sh
@@ -248,7 +261,34 @@ cp scripts/env_init.example.sh scripts/env_init.sh
 Then fill `scripts/env_init.sh` locally. Keep real secrets out of committed
 documentation and logs.
 
-Phase4 resolves Harbor from `HARBOR_BIN` first, then from `harbor` on `PATH`.
+### OpenAI-compatible backend
+
+Create the separate local provider file:
+
+```bash
+cp scripts/env_openai_init.example.sh scripts/env_openai_init.sh
+```
+
+Set `OPENAI_BASE_URL` to the provider's `/v1` API base and set
+`OPENAI_API_KEY`. The provider must support `POST /v1/responses` for the current
+LiteLLM route. Set any model name accepted by that API; it is passed through
+unchanged. Both local environment files are ignored by git.
+
+The `openai` settings in `model.json` apply only with `--openai`; optional
+`openai_phase_efforts` values override the OpenAI default by phase, while
+explicit `--model` and `--effort` arguments take precedence. Full Claude Code
+operation requires streaming and tool calling from the selected model and
+provider. The gateway does not disable thinking; the selected effort passes
+through Claude Code and may be normalized by LiteLLM to match model support.
+
+Each `run --openai` starts a temporary loopback LiteLLM proxy. A
+`pipeline --openai` shares one proxy across its Claude-backed phases and stops
+it on completion, failure, or interruption. Only the model transport changes:
+skills, subagents, and Bash remain Claude Code features. The project uses
+LiteLLM's standard Anthropic Messages translation.
+
+`cost.json` still records token usage in this mode, but its dollar total is a
+Claude Code estimate rather than provider billing.
 
 ## Artifacts
 

@@ -14,5 +14,16 @@
     "phase3": "max",
     "phase5": "high",
     "phase6": "high"
+  },
+  "openai": {
+    "openai_default_model": "gpt-5.4",
+    "openai_default_effort": "xhigh",
+    "openai_phase_efforts": {
+      "phase1": "xhigh",
+      "phase2": "xhigh",
+      "phase3": "xhigh",
+      "phase5": "xhigh",
+      "phase6": "xhigh"
+    }
   }
 }
