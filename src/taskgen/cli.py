@@ -90,6 +90,10 @@ PHASES: tuple[Phase, ...] = (
             Artifact("prompt", "prompts/skillnet-research.md"),
             Artifact("agent", "cc-definitions/agents/skillnet-researcher.md"),
             Artifact("skill", "cc-definitions/skills/tb-harbor-task-generation/SKILL.md"),
+            Artifact(
+                "search helper",
+                "cc-definitions/skills/tb-harbor-task-generation/scripts/skillnet_search.py",
+            ),
         ),
         outputs=(
             Artifact("skillnet index", "runs/skillnet/{seed_id}/skillnet_index.json"),

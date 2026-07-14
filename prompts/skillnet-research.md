@@ -33,9 +33,9 @@ Required work:
 
 1. Read `{{BRAINSTORM_PATH}}` as read-only input.
 2. Process every brainstorm idea in one run.
-3. Use each idea's exact `idea_id`, `title`, and `skillnet_queries`.
-4. Run or attempt SkillNet keyword search for each relevant query.
-5. Treat vector search as best-effort. After the first server-side vector failure in this run, record it once and skip remaining vector attempts.
+3. Keep each idea's exact `idea_id` and `title`. Use its `skillnet_queries` as the search intent.
+4. Start each idea with one short keyword query. If it succeeds but returns weak results, rephrase it once. If it fails, do not run a second keyword query.
+5. If keyword search fails or remains weak, try one vector query with threshold `0.65`. A vector failure affects only the current idea.
 6. Use `skillnet download` only while useful. After GitHub API rate limiting, 403, 429, or authentication failures, record the failure and switch to direct raw GitHub fetches when possible.
 7. Preserve raw search, download, fallback, and skipped-attempt evidence under `{{OUTPUT_PATH}}/<idea_id>/raw/`.
 8. Curate TB3-useful Claude Code skill packages under `{{OUTPUT_PATH}}/<idea_id>/skills/`.
@@ -54,10 +54,11 @@ Boundaries:
 
 SkillNet operating checklist:
 
-- Inspect CLI help if needed with `skillnet --help`, `skillnet search --help`, or `skillnet download --help`.
-- Save search output with wide, plain terminal settings so result URLs remain readable.
-- Record failed commands and stderr/stdout under the relevant `raw/` directory.
-- If search is weak, try one broader query, one domain-specific query, and one verifier/test-pattern query before using `no_strong_match`.
+- Use `.claude/skills/tb-harbor-task-generation/scripts/skillnet_search.py` for every search. Run one query at a time and read its JSON before continuing.
+- Save each result directly under the relevant `raw/` directory, for example: `python3 .claude/skills/tb-harbor-task-generation/scripts/skillnet_search.py --query "compact terms" --mode keyword --output "{{OUTPUT_PATH}}/<idea_id>/raw/search-01-keyword.json"`.
+- Retries are automatic. Do not repeat failed requests or run searches in parallel.
+- Use short keywords, not full sentences.
+- Inspect `skillnet download --help` if needed before downloading a selected result.
 - A failed `skillnet download` does not make an idea `failed` when enough useful material is available from search output or raw fetched files.
 
 Curated skill package checklist:

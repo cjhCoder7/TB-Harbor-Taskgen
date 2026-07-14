@@ -135,6 +135,7 @@ def ensure_phase2_inputs(root: Path, seed_id: str) -> list[str]:
         "prompts/skillnet-research.md",
         "cc-definitions/agents/skillnet-researcher.md",
         "cc-definitions/skills/tb-harbor-task-generation/SKILL.md",
+        "cc-definitions/skills/tb-harbor-task-generation/scripts/skillnet_search.py",
         "scripts/run-claude-logged.sh",
     ):
         candidate = root / required
