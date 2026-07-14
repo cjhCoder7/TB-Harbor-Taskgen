@@ -377,6 +377,34 @@ def phase_subject_lock_delegated_by_parent(root: Path, subject: str) -> bool:
     return True
 
 
+def claude_result_failure_reason(summary: dict[str, Any]) -> str | None:
+    """Return why a terminal Claude stream summary is not a successful result."""
+    if summary.get("parsed") is not True:
+        return "missing final result event"
+    result_event_found = summary.get("result_event_found")
+    if result_event_found is False:
+        return "missing final result event"
+    if result_event_found is not True and "result_event_found" in summary:
+        return "result_event_found must be a boolean"
+
+    is_error = summary.get("is_error")
+    if not isinstance(is_error, bool):
+        return "final result is missing a boolean is_error flag"
+    if is_error:
+        api_error_status = summary.get("api_error_status")
+        if isinstance(api_error_status, int) and not isinstance(api_error_status, bool):
+            return f"final result reported an API error (status {api_error_status})"
+        return "final result reported an error"
+
+    result_subtype = summary.get("result_subtype")
+    if result_subtype != "success":
+        return f"final result subtype is {result_subtype!r}, expected 'success'"
+    # Summaries written before result_event_found was introduced are safe to
+    # accept here: the old parser could only populate these terminal fields
+    # from an actual result event.
+    return None
+
+
 def validate_claude_session_reference(
     root: Path,
     claude_session_ref: Any,
@@ -456,6 +484,35 @@ def validate_claude_session_reference(
         errors.append("Claude session status exit_code must be 0")
     if status.get("timed_out") is not False:
         errors.append("Claude session status timed_out must be false")
+    if status.get("cost_pending") is not False:
+        errors.append("Claude session status cost_pending must be false")
+    cost = status.get("cost")
+    if not isinstance(cost, dict):
+        errors.append("Claude session status cost must be an object")
+    else:
+        result_error = claude_result_failure_reason(cost)
+        if result_error is not None:
+            errors.append(f"Claude session result must be successful: {result_error}")
+    result_validation_error = status.get("result_validation_error")
+    if result_validation_error is not None:
+        if not isinstance(result_validation_error, str):
+            errors.append("Claude session status result_validation_error must be null or a string")
+        elif result_validation_error:
+            errors.append(
+                "Claude session status contains a result validation error: "
+                f"{result_validation_error}"
+            )
+    if "missing_outputs" in status:
+        missing_outputs = status.get("missing_outputs")
+        if not isinstance(missing_outputs, list) or any(
+            not isinstance(item, str) for item in missing_outputs
+        ):
+            errors.append("Claude session status missing_outputs must be a list of strings")
+        elif missing_outputs:
+            errors.append("Claude session status missing_outputs must be empty")
+    output_sync_error = status.get("output_sync_error")
+    if output_sync_error is not None:
+        errors.append("Claude session status output_sync_error must be null")
     synced_outputs = status.get("synced_outputs")
     if not isinstance(synced_outputs, list) or any(
         not isinstance(item, str) for item in synced_outputs

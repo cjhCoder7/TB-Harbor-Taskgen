@@ -46,6 +46,7 @@ def mocked_gateway_runtime(
 ):
     process = MagicMock()
     process.pid = 24_680
+    process.poll.return_value = None
     gateway_environment = environment or {
         "OPENAI_BASE_URL": FAKE_UPSTREAM_URL,
         "OPENAI_API_KEY": FAKE_UPSTREAM_KEY,
@@ -82,7 +83,7 @@ def mocked_gateway_runtime(
                 side_effect=lambda: nullcontext(),
             )
         )
-        stack.enter_context(patch("builtins.print"))
+        print_mock = stack.enter_context(patch("builtins.print"))
         if write_side_effect is not None:
             stack.enter_context(
                 patch.object(
@@ -97,6 +98,7 @@ def mocked_gateway_runtime(
             popen=popen,
             wait_until_ready=wait_until_ready,
             terminate=terminate,
+            print_mock=print_mock,
         )
 
 
@@ -523,7 +525,8 @@ class OpenAIShellEntryPointTests(unittest.TestCase):
                 "  [[ ${GITHUB_MIRROR:-} == https://mirror.invalid/ ]]\n"
                 "  mkdir -p output/skillnet\n"
                 "  printf \"inherited\\n\" > output/skillnet/bash-child-env.txt\n"
-                "'\n",
+                "'\n"
+                "printf '%s\\n' '{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false}'\n",
             )
             write_model_config(
                 root,
@@ -824,6 +827,35 @@ class OpenAIGatewayTests(unittest.TestCase):
             with openai_gateway("native-model"):
                 pass
             runtime.terminate.assert_called_once_with(runtime.process, 10.0)
+            runtime.print_mock.assert_any_call(
+                "openai gateway: local LiteLLM ready for model 'native-model' on "
+                "http://127.0.0.1:41231; upstream is checked on first request"
+            )
+            runtime.print_mock.assert_any_call(
+                "openai gateway: local LiteLLM stopped for model 'native-model'"
+            )
+
+    def test_gateway_reports_unexpected_proxy_exit(self) -> None:
+        with mocked_gateway_runtime() as runtime:
+            with openai_gateway("native-model"):
+                runtime.process.poll.return_value = 17
+
+            runtime.print_mock.assert_any_call(
+                "openai gateway: local LiteLLM exited unexpectedly for model "
+                "'native-model' with exit_code=17"
+            )
+
+    def test_gateway_reports_startup_failure_separately(self) -> None:
+        with mocked_gateway_runtime() as runtime:
+            runtime.wait_until_ready.side_effect = RuntimeError("not ready")
+            with self.assertRaisesRegex(RuntimeError, "not ready"):
+                with openai_gateway("native-model"):
+                    pass
+
+            runtime.print_mock.assert_any_call(
+                "openai gateway: local LiteLLM startup failed for model "
+                "'native-model'; process cleaned up"
+            )
 
     def test_forced_process_group_cleanup_and_signal_exit_code(self) -> None:
         process = MagicMock()

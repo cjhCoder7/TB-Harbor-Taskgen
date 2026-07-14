@@ -299,6 +299,7 @@ def openai_gateway(
                 "1",
             ]
             process: subprocess.Popen[bytes] | None = None
+            ready = False
             with _cleanup_signal_handlers():
                 try:
                     process = subprocess.Popen(
@@ -317,6 +318,7 @@ def openai_gateway(
                         model,
                         startup_timeout_sec,
                     )
+                    ready = True
 
                     claude_environment = {
                         "ANTHROPIC_BASE_URL": base_url,
@@ -328,9 +330,24 @@ def openai_gateway(
                         claude_environment,
                         REMOVED_FROM_CLAUDE_ENV,
                     ):
-                        print(f"openai gateway: LiteLLM ready for model {model!r} on {base_url}")
+                        print(
+                            "openai gateway: local LiteLLM ready for model "
+                            f"{model!r} on {base_url}; upstream is checked on first request"
+                        )
                         yield OpenAIGateway(model=model, base_url=base_url, pid=process.pid)
                 finally:
                     if process is not None:
+                        return_code_before_cleanup = process.poll()
                         _terminate_process_group(process, shutdown_timeout_sec)
-                        print(f"openai gateway: LiteLLM stopped for model {model!r}")
+                        if ready and return_code_before_cleanup is not None:
+                            print(
+                                "openai gateway: local LiteLLM exited unexpectedly for model "
+                                f"{model!r} with exit_code={return_code_before_cleanup}"
+                            )
+                        elif ready:
+                            print(f"openai gateway: local LiteLLM stopped for model {model!r}")
+                        else:
+                            print(
+                                "openai gateway: local LiteLLM startup failed for model "
+                                f"{model!r}; process cleaned up"
+                            )

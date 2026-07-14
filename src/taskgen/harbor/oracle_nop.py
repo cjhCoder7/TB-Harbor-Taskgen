@@ -348,8 +348,17 @@ def command_run(args: argparse.Namespace) -> int:
     write_json_object_atomic(status_path, payload)
 
     print(f"oracle/nop status: {status_path}")
-    print(f"oracle reward: {oracle.reward if oracle.reward is not None else 'missing'}")
-    print(f"nop reward: {nop.reward if nop.reward is not None else 'missing'}")
+    print(f"oracle/nop result: {'passed' if payload['passed'] else 'failed'}")
+    print(
+        "oracle: "
+        f"reward={oracle.reward if oracle.reward is not None else 'missing'}, "
+        f"exit_code={oracle.exit_code}, timed_out={str(oracle.timed_out).lower()}"
+    )
+    print(
+        "nop: "
+        f"reward={nop.reward if nop.reward is not None else 'missing'}, "
+        f"exit_code={nop.exit_code}, timed_out={str(nop.timed_out).lower()}"
+    )
     return 0 if payload["passed"] else 1
 
 

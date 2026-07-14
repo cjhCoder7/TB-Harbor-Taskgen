@@ -943,6 +943,7 @@ def write_status(
     timeout_sec: float | None = None,
     missing_outputs: list[str] | None = None,
     output_sync_error: str | None = None,
+    result_validation_error: str | None = None,
 ) -> dict[str, object]:
     require_safe_run_id(run_id)
     payload: dict[str, Any] = {
@@ -965,6 +966,7 @@ def write_status(
         "synced_outputs": synced_outputs,
         "missing_outputs": list(missing_outputs or []),
         "output_sync_error": output_sync_error,
+        "result_validation_error": result_validation_error,
         "total_cost_usd": None,
         "cost": None,
         "cost_pending": True,

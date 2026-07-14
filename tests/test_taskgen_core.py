@@ -22,6 +22,7 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from taskgen.claude.cost import OpenRouterQueryError
+from taskgen.claude.cost import command_summarize as command_summarize_claude_cost
 from taskgen.claude.cost import fetch_openrouter_generation_stats, read_float_env
 from taskgen.claude.cost import parse_claude_stream_log
 from taskgen.claude.cost import format_cost_summary
@@ -62,6 +63,8 @@ from taskgen.common import (
     phase_subject_lock_delegated_by_parent,
     validate_claude_session_reference,
 )
+from taskgen.harbor.oracle_nop import HarborCheck
+from taskgen.harbor.oracle_nop import command_run as command_run_harbor
 from taskgen.harbor.oracle_nop import extract_reward, run_harbor_check
 from taskgen.maintenance.clean_intermediate import clean_targets, command_clean
 from taskgen.phases.phase1_seed_brainstorm import render_phase1_prompt, validate_brainstorm_data
@@ -136,6 +139,16 @@ def write_fake_claude_session(project: Path, phase: str, subject: str, run_id: s
                 "exit_code": 0,
                 "timed_out": False,
                 "synced_outputs": synced_outputs,
+                "cost_pending": False,
+                "missing_outputs": [],
+                "output_sync_error": None,
+                "cost": {
+                    "parsed": True,
+                    "result_event_found": True,
+                    "result_subtype": "success",
+                    "is_error": False,
+                },
+                "result_validation_error": None,
             }
         ),
         encoding="utf-8",
@@ -462,6 +475,7 @@ class ClaudeRunnerTests(unittest.TestCase):
                 patch("taskgen.claude.runner.build_claude_command", return_value=["claude"]),
                 patch("taskgen.claude.runner.subprocess.Popen", return_value=process) as popen,
                 patch("taskgen.claude.runner.write_status", return_value={}) as write_status,
+                patch("builtins.print") as print_mock,
             ):
                 exit_code = run_claude_logged(args)
 
@@ -477,6 +491,141 @@ class ClaudeRunnerTests(unittest.TestCase):
         self.assertEqual(
             write_status.call_args.kwargs["worktree_guard_path"],
             workspace_payload["worktree_guard_path"],
+        )
+        print_mock.assert_any_call(
+            "claude run result: failed, exit_code=1",
+            file=sys.stderr,
+        )
+
+    def test_error_result_with_zero_process_exit_is_not_synced(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace_payload, args = fake_claude_runner_fixture(root)
+
+            def fake_run(*_args: object, **kwargs: object) -> tuple[int, bool]:
+                log_handle = kwargs["log_handle"]
+                assert hasattr(log_handle, "write")
+                log_handle.write(
+                    (
+                        json.dumps(
+                            {
+                                "type": "result",
+                                "subtype": "success",
+                                "is_error": True,
+                                "api_error_status": 503,
+                            }
+                        )
+                        + "\n"
+                    ).encode("utf-8")
+                )
+                return 0, False
+
+            error_cost = {
+                "result_subtype": "success",
+                "is_error": True,
+                "api_error_status": 503,
+            }
+            with (
+                patch("taskgen.claude.runner.project_root", return_value=root),
+                patch("taskgen.claude.runner.run_id", return_value="run-1"),
+                patch("taskgen.claude.runner.prepare_workspace", return_value=workspace_payload),
+                patch("taskgen.claude.runner.build_claude_command", return_value=["claude"]),
+                patch("taskgen.claude.runner.run_claude_process", side_effect=fake_run),
+                patch("taskgen.claude.runner.sync_workspace_outputs") as sync_outputs,
+                patch(
+                    "taskgen.claude.runner.write_status",
+                    return_value={"cost": error_cost},
+                ) as write_status,
+                patch("builtins.print") as print_mock,
+            ):
+                exit_code = run_claude_logged(args)
+
+        self.assertEqual(exit_code, 1)
+        sync_outputs.assert_not_called()
+        self.assertEqual(
+            write_status.call_args.kwargs["result_validation_error"],
+            "final result reported an API error (status 503)",
+        )
+        print_mock.assert_any_call(
+            "claude result invalid: final result reported an API error (status 503)",
+            file=sys.stderr,
+        )
+        print_mock.assert_any_call(
+            "claude summary: result=error, api_status=503",
+            file=sys.stderr,
+        )
+        print_mock.assert_any_call(
+            "claude run result: failed, exit_code=1",
+            file=sys.stderr,
+        )
+
+    def test_zero_process_exit_without_final_result_is_not_synced(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace_payload, args = fake_claude_runner_fixture(root)
+            with (
+                patch("taskgen.claude.runner.project_root", return_value=root),
+                patch("taskgen.claude.runner.run_id", return_value="run-1"),
+                patch("taskgen.claude.runner.prepare_workspace", return_value=workspace_payload),
+                patch("taskgen.claude.runner.build_claude_command", return_value=["claude"]),
+                patch("taskgen.claude.runner.run_claude_process", return_value=(0, False)),
+                patch("taskgen.claude.runner.sync_workspace_outputs") as sync_outputs,
+                patch("taskgen.claude.runner.write_status", return_value={}) as write_status,
+            ):
+                exit_code = run_claude_logged(args)
+
+        self.assertEqual(exit_code, 1)
+        sync_outputs.assert_not_called()
+        self.assertEqual(
+            write_status.call_args.kwargs["result_validation_error"],
+            "missing final result event",
+        )
+
+    def test_successful_final_result_is_synced_and_reported_successfully(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace_payload, args = fake_claude_runner_fixture(root)
+
+            def fake_run(*_args: object, **kwargs: object) -> tuple[int, bool]:
+                kwargs["log_handle"].write(
+                    b'{"type":"result","subtype":"success","is_error":false}\n'
+                )
+                return 0, False
+
+            success_cost = {
+                "parsed": True,
+                "result_event_found": True,
+                "result_subtype": "success",
+                "is_error": False,
+            }
+            with (
+                patch("taskgen.claude.runner.project_root", return_value=root),
+                patch("taskgen.claude.runner.run_id", return_value="run-1"),
+                patch("taskgen.claude.runner.prepare_workspace", return_value=workspace_payload),
+                patch("taskgen.claude.runner.build_claude_command", return_value=["claude"]),
+                patch("taskgen.claude.runner.run_claude_process", side_effect=fake_run),
+                patch(
+                    "taskgen.claude.runner.sync_workspace_outputs",
+                    return_value=["runs/brainstorm/seed-a/seed_brainstorm.json"],
+                ) as sync_outputs,
+                patch(
+                    "taskgen.claude.runner.write_status",
+                    return_value={"cost": success_cost, "cost_write_error": "disk full"},
+                ) as write_status,
+                patch("builtins.print") as print_mock,
+            ):
+                exit_code = run_claude_logged(args)
+
+        self.assertEqual(exit_code, 0)
+        sync_outputs.assert_called_once()
+        self.assertIsNone(write_status.call_args.kwargs["result_validation_error"])
+        print_mock.assert_any_call(
+            "claude run result: success, exit_code=0",
+            file=sys.stderr,
+        )
+        print_mock.assert_any_call(
+            "claude cost file write failed: disk full",
+            file=sys.stderr,
         )
 
     def test_run_claude_records_timeout_without_syncing_outputs(self) -> None:
@@ -525,12 +674,18 @@ class ClaudeRunnerTests(unittest.TestCase):
             process = MagicMock()
             process.wait.return_value = 0
 
+            def fake_popen(*_args: object, **kwargs: object) -> MagicMock:
+                kwargs["stdout"].write(
+                    b'{"type":"result","subtype":"success","is_error":false}\n'
+                )
+                return process
+
             with (
                 patch("taskgen.claude.runner.project_root", return_value=root),
                 patch("taskgen.claude.runner.run_id", return_value="run-1"),
                 patch("taskgen.claude.runner.prepare_workspace", return_value=workspace_payload),
                 patch("taskgen.claude.runner.build_claude_command", return_value=["claude"]),
-                patch("taskgen.claude.runner.subprocess.Popen", return_value=process),
+                patch("taskgen.claude.runner.subprocess.Popen", side_effect=fake_popen),
                 patch("taskgen.claude.runner.write_status", return_value={}) as write_status,
             ):
                 exit_code = run_claude_logged(args)
@@ -1652,6 +1807,79 @@ class ClaudeSessionReferenceTests(unittest.TestCase):
             self.assertIn("timed_out must be false", combined)
             self.assertIn("synced_outputs must exactly equal", combined)
 
+    def test_session_reference_rejects_conflicting_or_incomplete_result_summary(self) -> None:
+        invalid_updates = (
+            (
+                {"cost": {
+                    "parsed": True,
+                    "result_event_found": True,
+                    "result_subtype": "success",
+                    "is_error": True,
+                    "api_error_status": 503,
+                }},
+                "reported an API error",
+            ),
+            ({"cost_pending": True}, "cost_pending must be false"),
+            (
+                {"cost": {
+                    "parsed": False,
+                    "result_event_found": False,
+                    "result_subtype": None,
+                    "is_error": None,
+                }},
+                "missing final result event",
+            ),
+            ({"result_validation_error": "missing final result event"}, "validation error"),
+            ({"missing_outputs": ["output/task"]}, "missing_outputs must be empty"),
+            ({"output_sync_error": "publish failed"}, "output_sync_error must be null"),
+        )
+
+        for update, expected_error in invalid_updates:
+            with self.subTest(update=update), tempfile.TemporaryDirectory() as project_tmp:
+                project = Path(project_tmp)
+                session_ref = write_fake_claude_session(
+                    project,
+                    "task-review",
+                    "seed-a__idea-1",
+                )
+                status_path = project / session_ref / "status.json"
+                status = json.loads(status_path.read_text(encoding="utf-8"))
+                status.update(update)
+                status_path.write_text(json.dumps(status), encoding="utf-8")
+
+                errors = validate_claude_session_reference(
+                    project,
+                    session_ref,
+                    expected_phase="task-review",
+                    expected_subject="seed-a__idea-1",
+                    expected_outputs=["runs/reviews/seed-a__idea-1"],
+                )
+
+                self.assertIn(expected_error, "\n".join(errors))
+
+    def test_session_reference_accepts_legacy_success_summary(self) -> None:
+        with tempfile.TemporaryDirectory() as project_tmp:
+            project = Path(project_tmp)
+            session_ref = write_fake_claude_session(
+                project,
+                "task-review",
+                "seed-a__idea-1",
+            )
+            status_path = project / session_ref / "status.json"
+            status = json.loads(status_path.read_text(encoding="utf-8"))
+            status["cost"].pop("result_event_found")
+            status_path.write_text(json.dumps(status), encoding="utf-8")
+
+            errors = validate_claude_session_reference(
+                project,
+                session_ref,
+                expected_phase="task-review",
+                expected_subject="seed-a__idea-1",
+                expected_outputs=["runs/reviews/seed-a__idea-1"],
+            )
+
+        self.assertEqual(errors, [])
+
     @unittest.skipUnless(hasattr(os, "symlink"), "symbolic links are unavailable")
     def test_session_reference_cannot_escape_expected_session_root(self) -> None:
         with tempfile.TemporaryDirectory() as project_tmp, tempfile.TemporaryDirectory() as outside_tmp:
@@ -1692,6 +1920,7 @@ class ClaudeCostTests(unittest.TestCase):
                             {
                                 "type": "result",
                                 "subtype": "success",
+                                "is_error": False,
                                 "session_id": "session-1",
                                 "total_cost_usd": 0.12,
                                 "usage": {"input_tokens": 10, "output_tokens": 5, "cost": 0.12},
@@ -1710,6 +1939,64 @@ class ClaudeCostTests(unittest.TestCase):
             self.assertEqual(summary["total_cost_usd"], 0.12)
             self.assertEqual(summary["provider_usage_cost"], 0.12)
             self.assertEqual(summary["usage"]["input_tokens"], 10)
+            self.assertIs(summary["parsed"], True)
+            self.assertIs(summary["result_event_found"], True)
+            self.assertIs(summary["is_error"], False)
+
+    def test_api_error_result_overrides_success_subtype(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            log_path = Path(tmp) / "claude-code.txt"
+            log_path.write_text(
+                json.dumps(
+                    {
+                        "type": "result",
+                        "subtype": "success",
+                        "is_error": True,
+                        "api_error_status": 503,
+                        "result": "API Error: upstream unavailable",
+                        "model": "gpt-test",
+                        "total_cost_usd": 0.25,
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            summary = parse_claude_stream_log(log_path)
+
+            self.assertIs(summary["parsed"], True)
+            self.assertIs(summary["result_event_found"], True)
+            self.assertIs(summary["is_error"], True)
+            self.assertEqual(summary["api_error_status"], 503)
+            self.assertEqual(
+                format_cost_summary(summary),
+                "model=gpt-test, cost=$0.250000, result=error, api_status=503",
+            )
+
+    def test_log_without_final_result_is_marked_incomplete(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            log_path = Path(tmp) / "claude-code.txt"
+            log_path.write_text(
+                '{"type":"system","subtype":"init"}\nnot-json\n{bad json\n',
+                encoding="utf-8",
+            )
+
+            summary = parse_claude_stream_log(log_path)
+
+            self.assertIs(summary["parsed"], True)
+            self.assertIs(summary["result_event_found"], False)
+            self.assertEqual(summary["json_event_count"], 1)
+            self.assertEqual(summary["invalid_json_line_count"], 1)
+
+            with patch("builtins.print"):
+                exit_code = command_summarize_claude_cost(
+                    SimpleNamespace(
+                        stream_log=log_path,
+                        no_openrouter_query=True,
+                        output=None,
+                    )
+                )
+            self.assertEqual(exit_code, 1)
 
     def test_parse_openrouter_generation_ids(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1847,6 +2134,39 @@ class ClaudeCostTests(unittest.TestCase):
             self.assertEqual(summary["openrouter"]["successful_generation_count"], 1)
             self.assertEqual(summary["openrouter"]["failed_generation_count"], 1)
 
+    def test_openrouter_query_error_records_that_the_query_was_attempted(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            log_path = Path(tmp) / "claude-code.txt"
+            log_path.write_text(
+                "\n".join(
+                    [
+                        json.dumps({"type": "assistant", "message": {"id": "gen-1"}}),
+                        json.dumps(
+                            {
+                                "type": "result",
+                                "subtype": "success",
+                                "is_error": False,
+                            }
+                        ),
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            def fail_query(_generation_id: str, _api_key: str) -> dict[str, object]:
+                raise RuntimeError("metadata service unavailable")
+
+            summary = summarize_claude_stream_log(
+                log_path,
+                openrouter_api_key="test-key",
+                fetch_openrouter_generation=fail_query,
+            )
+
+        self.assertIs(summary["openrouter"]["queried"], False)
+        self.assertIs(summary["openrouter"]["query_attempted"], True)
+        self.assertEqual(summary["openrouter"]["reason"], "query_error")
+
     def test_format_cost_summary(self) -> None:
         summary = {
             "model": "test/model",
@@ -1854,11 +2174,40 @@ class ClaudeCostTests(unittest.TestCase):
             "num_turns": 3,
             "duration_ms": 12500,
             "result_subtype": "success",
+            "is_error": False,
         }
 
         self.assertEqual(
             format_cost_summary(summary),
             "model=test/model, cost=$1.250000, turns=3, duration=12.5s, result=success",
+        )
+
+    def test_invalid_api_error_status_is_not_displayed(self) -> None:
+        summary = {
+            "result_subtype": "success",
+            "is_error": True,
+            "api_error_status": True,
+        }
+
+        self.assertEqual(format_cost_summary(summary), "result=error")
+
+    def test_error_subtype_remains_visible(self) -> None:
+        summary = {
+            "result_subtype": "error_max_turns",
+            "is_error": True,
+        }
+
+        self.assertEqual(
+            format_cost_summary(summary),
+            "result=error_max_turns",
+        )
+
+    def test_success_subtype_without_boolean_error_flag_is_invalid(self) -> None:
+        summary = {"result_subtype": "success"}
+
+        self.assertEqual(
+            format_cost_summary(summary),
+            "result=invalid, subtype=success",
         )
 
     def test_successful_generation_missing_cost_does_not_override_stream_cost(self) -> None:
@@ -1910,6 +2259,7 @@ class ClaudeCostTests(unittest.TestCase):
         self.assertFalse(stats["complete"])
         self.assertFalse(stats["cost_complete"])
         self.assertEqual(stats["queried_generation_count"], 1)
+        self.assertIs(stats["query_attempted"], True)
         self.assertEqual(stats["unqueried_generation_count"], 1)
 
     def test_nonfinite_openrouter_float_environment_value_uses_default(self) -> None:
@@ -2691,6 +3041,53 @@ class Phase3ValidationTests(unittest.TestCase):
 
 
 class HarborHardeningTests(unittest.TestCase):
+    def test_failed_harbor_summary_includes_result_exit_codes_and_timeout(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            task = root / "task"
+            task.mkdir()
+            (task / "task.toml").write_text('version = "1.0"\n', encoding="utf-8")
+            oracle = HarborCheck(
+                agent="oracle",
+                exit_code=124,
+                reward=None,
+                log=root / "oracle.log",
+                job_dir=root / "oracle-job",
+                timed_out=True,
+                timeout_sec=30,
+            )
+            nop = HarborCheck(
+                agent="nop",
+                exit_code=0,
+                reward=0.0,
+                log=root / "nop.log",
+                job_dir=root / "nop-job",
+                timed_out=False,
+                timeout_sec=30,
+            )
+
+            with (
+                patch("taskgen.harbor.oracle_nop.project_root", return_value=root),
+                patch("taskgen.harbor.oracle_nop.resolve_harbor_command", return_value=["harbor"]),
+                patch("taskgen.harbor.oracle_nop.resolve_harbor_check_timeout_sec", return_value=30),
+                patch("taskgen.harbor.oracle_nop.utc_run_id", return_value="run-1"),
+                patch(
+                    "taskgen.harbor.oracle_nop.run_harbor_check",
+                    side_effect=[oracle, nop],
+                ),
+                patch("builtins.print") as print_mock,
+            ):
+                exit_code = command_run_harbor(
+                    SimpleNamespace(task_path="task", task_id="task-a")
+                )
+
+        self.assertEqual(exit_code, 1)
+        print_mock.assert_any_call("oracle/nop result: failed")
+        print_mock.assert_any_call(
+            "oracle: reward=missing, exit_code=124, timed_out=true"
+        )
+        print_mock.assert_any_call("nop: reward=0.0, exit_code=0, timed_out=false")
+
     def test_boolean_reward_is_not_numeric(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

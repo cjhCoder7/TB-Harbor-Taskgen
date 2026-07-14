@@ -96,6 +96,10 @@ def string_or_none(value: Any) -> str | None:
     return value if isinstance(value, str) and value else None
 
 
+def integer_or_none(value: Any) -> int | None:
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
 def iter_json_events(path: Path) -> Iterator[tuple[dict[str, Any] | None, bool]]:
     """Yield parsed object events without loading the entire stream log."""
     if not path.exists():
@@ -263,16 +267,32 @@ def parse_claude_stream_log(stream_log: Path) -> dict[str, Any]:
 
     total_cost_usd = number_or_none(result_event.get("total_cost_usd")) if result_event else None
 
+    result_event_found = result_event is not None
+    result_subtype = (
+        string_or_none(result_event.get("subtype")) if result_event is not None else None
+    )
+    is_error = (
+        result_event.get("is_error")
+        if result_event is not None and isinstance(result_event.get("is_error"), bool)
+        else None
+    )
+    api_error_status = (
+        integer_or_none(result_event.get("api_error_status"))
+        if result_event is not None
+        else None
+    )
     summary = {
         "stream_log": str(stream_log),
         "parsed": stream_log.exists(),
+        "result_event_found": result_event_found,
         "line_count": line_count,
         "json_event_count": json_event_count,
         "invalid_json_line_count": invalid_json_line_count,
         "session_id": session_id,
         "model": model,
-        "result_subtype": result_event.get("subtype") if result_event else None,
-        "is_error": result_event.get("is_error") if result_event else None,
+        "result_subtype": result_subtype,
+        "is_error": is_error,
+        "api_error_status": api_error_status,
         "num_turns": result_event.get("num_turns") if result_event else None,
         "duration_ms": number_or_none(result_event.get("duration_ms")) if result_event else None,
         "duration_api_ms": number_or_none(result_event.get("duration_api_ms")) if result_event else None,
@@ -563,6 +583,7 @@ def fetch_openrouter_generation_stats(
 
     return {
         "queried": True,
+        "query_attempted": True,
         "generation_count": len(generation_ids),
         "queried_generation_count": queried_generation_count,
         "successful_generation_count": len(generations),
@@ -598,6 +619,7 @@ def enrich_with_openrouter_generation_stats(
     if not generation_ids:
         summary["openrouter"] = {
             "queried": False,
+            "query_attempted": False,
             "reason": "no_generation_ids",
             "generation_count": 0,
         }
@@ -607,6 +629,7 @@ def enrich_with_openrouter_generation_stats(
     if not resolved_api_key:
         summary["openrouter"] = {
             "queried": False,
+            "query_attempted": False,
             "reason": "missing_api_key",
             "generation_count": len(generation_ids),
         }
@@ -621,6 +644,7 @@ def enrich_with_openrouter_generation_stats(
     except Exception as exc:
         summary["openrouter"] = {
             "queried": False,
+            "query_attempted": True,
             "reason": "query_error",
             "generation_count": len(generation_ids),
             "error": str(exc)[:500],
@@ -674,8 +698,22 @@ def format_cost_summary(summary: dict[str, Any]) -> str:
         parts.append(f"duration={duration_ms / 1000:.1f}s")
 
     result_subtype = summary.get("result_subtype")
-    if isinstance(result_subtype, str) and result_subtype:
+    is_error = summary.get("is_error")
+    if isinstance(result_subtype, str) and result_subtype and result_subtype != "success":
         parts.append(f"result={result_subtype}")
+    elif is_error is True:
+        parts.append("result=error")
+    elif result_subtype == "success" and is_error is False:
+        parts.append("result=success")
+    elif isinstance(result_subtype, str) and result_subtype:
+        parts.append("result=invalid")
+        parts.append(f"subtype={result_subtype}")
+    elif summary.get("result_event_found") is True:
+        parts.append("result=invalid")
+
+    api_error_status = integer_or_none(summary.get("api_error_status"))
+    if is_error is True and api_error_status is not None:
+        parts.append(f"api_status={api_error_status}")
 
     return ", ".join(parts) if parts else "cost unavailable"
 
@@ -707,7 +745,7 @@ def command_summarize(args: argparse.Namespace) -> int:
         write_cost_summary(summary, args.output)
     else:
         print(json.dumps(summary, indent=2, ensure_ascii=False))
-    return 0
+    return 0 if summary.get("result_event_found") is True else 1
 
 
 def build_parser() -> argparse.ArgumentParser:

@@ -16,7 +16,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import BinaryIO
 
-from taskgen.claude.cost import format_cost_summary
+from taskgen.claude.cost import (
+    format_cost_summary,
+    parse_claude_stream_log,
+)
 from taskgen.claude.workspace import (
     MissingWorkspaceOutputsError,
     WorkspaceOutputError,
@@ -25,6 +28,7 @@ from taskgen.claude.workspace import (
     write_status,
 )
 from taskgen.common import (
+    claude_result_failure_reason,
     phase_subject_lock,
     phase_subject_lock_delegated_by_parent,
     project_root,
@@ -41,6 +45,7 @@ from taskgen.config import (
 PERMISSION_ARGS = ("--permission-mode", "bypassPermissions")
 TIMEOUT_EXIT_CODE = 124
 OUTPUT_SYNC_EXIT_CODE = 1
+RESULT_VALIDATION_EXIT_CODE = 1
 
 
 def executable_candidates(root: Path) -> list[Path]:
@@ -288,6 +293,14 @@ def run_prepared_claude_logged(
                 f"\nClaude Code timed out after {timeout_sec:g} seconds.\n".encode("utf-8")
             )
 
+    result_validation_error: str | None = None
+    if exit_code == 0:
+        result_validation_error = claude_result_failure_reason(
+            parse_claude_stream_log(stream_log)
+        )
+        if result_validation_error is not None:
+            exit_code = RESULT_VALIDATION_EXIT_CODE
+
     synced_outputs: list[str] = []
     missing_outputs: list[str] = []
     output_sync_error: str | None = None
@@ -327,6 +340,7 @@ def run_prepared_claude_logged(
         timeout_sec=timeout_sec,
         missing_outputs=missing_outputs,
         output_sync_error=output_sync_error,
+        result_validation_error=result_validation_error,
     )
 
     cost = status.get("cost")
@@ -336,10 +350,18 @@ def run_prepared_claude_logged(
     print(f"claude workspace: {workspace_dir}", file=sys.stderr)
     if timed_out:
         print(f"claude timeout: exceeded {timeout_sec:g} seconds", file=sys.stderr)
+    if result_validation_error:
+        print(f"claude result invalid: {result_validation_error}", file=sys.stderr)
     if output_sync_error:
         print(f"claude output sync failed: {output_sync_error}", file=sys.stderr)
     print(f"claude summary: {cost_summary}", file=sys.stderr)
-    print(f"claude cost file: {cost_path}", file=sys.stderr)
+    run_result = "success" if exit_code == 0 else "failed"
+    print(f"claude run result: {run_result}, exit_code={exit_code}", file=sys.stderr)
+    cost_write_error = status.get("cost_write_error")
+    if isinstance(cost_write_error, str) and cost_write_error:
+        print(f"claude cost file write failed: {cost_write_error}", file=sys.stderr)
+    else:
+        print(f"claude cost file: {cost_path}", file=sys.stderr)
     return exit_code
 
 
