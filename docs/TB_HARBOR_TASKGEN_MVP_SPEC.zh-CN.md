@@ -118,9 +118,12 @@ phase4 之后使用的稳定 task id 是：
 | `scripts/run-claude-logged.sh` | 运行 Claude wrapper 并记录 session metadata。 |
 | `scripts/run-harbor-oracle-nop.sh` | 运行 Harbor oracle/nop 检查。 |
 | `scripts/clean-intermediate.sh` | 清理中间运行产物。 |
+| `scripts/github_init.example.sh` | Phase2 SkillNet 下载使用的本地 GitHub 环境模板。 |
 | `scripts/tool_init.sh` | 通过 `uv tool install` 安装 `harbor==0.13.2`、`skillnet-ai==0.0.18` 和 `litellm[proxy]==1.91.1`。 |
 
-对应文件存在时，`scripts/taskgen.sh` 默认 source `scripts/env_init.sh`，传入 `--openai` 时改为 source `scripts/env_openai_init.sh`。两个文件都只用于本机并被 git 忽略，可从对应的 `.example.sh` 文件创建。嵌套 wrapper 会保留已启用的网关环境；所有 wrapper 都会把 `src/` 加入 `PYTHONPATH`。
+对应文件存在时，`scripts/taskgen.sh` 默认 source `scripts/env_init.sh`，传入 `--openai` 时改为 source `scripts/env_openai_init.sh`。Claude wrapper 还会仅在 phase 为 `skillnet-research` 时加载 `scripts/github_init.sh`，与模型后端无关。这些本地文件都被 git 忽略，并从各自的 `.example.sh` 创建。嵌套 wrapper 会保留已启用的网关环境；所有 wrapper 都会把 `src/` 加入 `PYTHONPATH`。
+
+`github_init.sh` 把 `GITHUB_TOKEN` 提供给 phase2 Claude Code 进程及其 Bash 工具，用于认证下载和提高 GitHub API 限额。example 保持凭据为空，并说明可选的 raw-content mirror。只能配置完全可信的镜像：当前固定的 SkillNet 版本可能把 GitHub Authorization header 发送给镜像主机，而 GitHub API 访问仍需直接认证。
 
 ## 5. CLI
 
@@ -289,6 +292,7 @@ Manifest event：`brainstormed`。
 - `prompts/skillnet-research.md`。
 - `cc-definitions/agents/skillnet-researcher.md`。
 - 基础 generation skill。
+- 可选的 `GITHUB_TOKEN` 和 `GITHUB_MIRROR`，来自被忽略的本地 `scripts/github_init.sh`。
 
 输出：
 
@@ -484,7 +488,7 @@ scripts/clean-intermediate.sh --apply --discard-transactions
 
 无论执行 dry-run 列表还是实际删除，清理都要求 project root 以及存在的 `runs/`、`src/`、`scripts/`、`tests/` container 是真实目录；目标若经过 symlink 或非目录 ancestor 会被拒绝，查找 Python cache 时也不会跟随 directory symlink。若 cleanup target 自身是 symlink，则只 unlink 该链接，外部目标保持不变。
 
-当前 ignore 规则会让本地 credentials、seed inputs、运行产物、generated task outputs、Python caches 和本地 Claude binary 不进入 git。`model.json` 仍保留预期的本地 Claude binary 路径。
+当前 ignore 规则会让包括 `scripts/github_init.sh` 在内的本地 credentials、seed inputs、运行产物、generated task outputs、Python caches 和本地 Claude binary 不进入 git。`scripts/github_init.example.sh` 必须保持无真实凭据，phase2 产物和日志也不得包含 Token。`model.json` 仍保留预期的本地 Claude binary 路径。
 
 ## 11. 开发检查
 

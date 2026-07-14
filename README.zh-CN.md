@@ -77,6 +77,8 @@ python3 -m pip install -e .
 scripts/tool_init.sh
 ```
 
+如需在 phase2 中进行认证的 SkillNet 下载，请按 [SkillNet GitHub 下载](#skillnet-github-下载)创建可选的本地 GitHub 配置。
+
 首次运行模型 phase 前，先完成[配置](#配置)中的 binary 和 provider 设置。
 
 查看可用 phases：
@@ -176,7 +178,7 @@ flowchart LR
 └── pyproject.toml
 ```
 
-`scripts/taskgen.sh` 会加载所选后端的本地环境、设置 `PYTHONPATH=src`，再转发到 Python package。
+`scripts/taskgen.sh` 会加载所选后端的本地环境、设置 `PYTHONPATH=src`，再转发到 Python package。phase2 的 Claude launcher 会在配置存在时单独加载本地 GitHub 下载环境。
 
 ## 配置
 
@@ -236,6 +238,19 @@ mkdir -p "$CLAUDE_BIN_DIR" && curl -fsSL "https://downloads.claude.ai/claude-cod
 ```
 
 如果下载到了非默认路径，请同步更新 `model.json` 里的 `claude_code_path`。`CLAUDE_PLATFORM` 需要和运行机器一致；常见值包括 `linux-x64`、`linux-arm64`、`linux-x64-musl` 和 `linux-arm64-musl`。
+
+### SkillNet GitHub 下载
+
+Phase2 可以为 SkillNet 下载提供 GitHub 认证，同时不把凭据传入其他 Claude Code phases。创建被忽略的本地文件，并填写专用、最小权限的 Token：
+
+```bash
+cp scripts/github_init.example.sh scripts/github_init.sh
+chmod 600 scripts/github_init.sh
+```
+
+无论使用哪种模型后端，`scripts/run-claude-logged.sh` 都只会在 `skillnet-research` 阶段加载该文件，因此 Token 会提供给该阶段的 Claude Code 进程及其 Bash 工具。`GITHUB_TOKEN` 可提高 GitHub API 限额并访问私有仓库；不要把真实值写入 example、commit、prompt 或日志。
+
+example 还说明了可选的 raw-content mirror。除非完全信任镜像主机，否则应保持未设置：当前固定的 SkillNet 版本在认证下载时可能把 GitHub Authorization header 发送给镜像，而且镜像不能代替 GitHub API 认证。
 
 ### Claude 后端
 

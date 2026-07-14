@@ -118,9 +118,12 @@ The optional `openai` values are selected only with `--openai`, but the object i
 | `scripts/run-claude-logged.sh` | Runs the Claude wrapper and records session metadata. |
 | `scripts/run-harbor-oracle-nop.sh` | Runs Harbor oracle/nop checks. |
 | `scripts/clean-intermediate.sh` | Cleans intermediate runtime artifacts. |
+| `scripts/github_init.example.sh` | Templates the local GitHub environment used by phase2 SkillNet downloads. |
 | `scripts/tool_init.sh` | Installs `harbor==0.13.2`, `skillnet-ai==0.0.18`, and `litellm[proxy]==1.91.1` with `uv tool install`. |
 
-When present, `scripts/taskgen.sh` sources `scripts/env_init.sh` by default or `scripts/env_openai_init.sh` with `--openai`. Both files are local-only and ignored by git; create them from the corresponding `.example.sh` file. Nested wrappers preserve an active gateway environment, and all wrappers add `src/` to `PYTHONPATH`.
+When present, `scripts/taskgen.sh` sources `scripts/env_init.sh` by default or `scripts/env_openai_init.sh` with `--openai`. The Claude wrapper additionally sources `scripts/github_init.sh` only when its phase is `skillnet-research`, independent of the model backend. These local files are ignored by git and created from their corresponding `.example.sh` files. Nested wrappers preserve an active gateway environment, and all wrappers add `src/` to `PYTHONPATH`.
+
+`github_init.sh` supplies `GITHUB_TOKEN` to the phase2 Claude Code process and its Bash tools for authenticated downloads and higher GitHub API limits. Its example leaves credentials empty and documents an optional raw-content mirror. Only configure a fully trusted mirror: the pinned SkillNet version may send the GitHub authorization header to the mirror host, while GitHub API access still requires direct authentication.
 
 ## 5. CLI
 
@@ -287,6 +290,7 @@ Inputs:
 - `prompts/skillnet-research.md`.
 - `cc-definitions/agents/skillnet-researcher.md`.
 - Base generation skill.
+- Optional `GITHUB_TOKEN` and `GITHUB_MIRROR` from the ignored local `scripts/github_init.sh`.
 
 Outputs:
 
@@ -482,7 +486,7 @@ It then restores the `runs/` skeleton directories with `.gitkeep` files. The app
 
 Before either a dry-run listing or deletion, cleanup requires the project root and the `runs/`, `src/`, `scripts/`, and `tests/` containers (when present) to be real directories. It also rejects targets reached through a symlink or non-directory ancestor and does not follow directory symlinks while locating Python caches. A cleanup target that is itself a symlink is only unlinked; its external target is left untouched.
 
-Current ignore rules keep local credentials, seed inputs, runtime artifacts, generated task outputs, Python caches, and the local Claude binary out of git. `model.json` still points to the expected local Claude binary path.
+Current ignore rules keep local credentials, including `scripts/github_init.sh`, seed inputs, runtime artifacts, generated task outputs, Python caches, and the local Claude binary out of git. `scripts/github_init.example.sh` must remain credential-free, and phase2 artifacts or logs must never contain the token. `model.json` still points to the expected local Claude binary path.
 
 ## 11. Development Checks
 

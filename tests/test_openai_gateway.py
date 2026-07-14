@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -432,6 +433,264 @@ class OpenAIShellEntryPointTests(unittest.TestCase):
         self.assertTrue(openai_result.stdout.startswith("openai|absent\n"))
         self.assertIn("<--openai>", openai_result.stdout)
         self.assertTrue(similar_result.stdout.startswith("claude|present\n"))
+
+    def test_claude_wrapper_sources_github_environment_only_for_skillnet_phase(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            scripts = root / "scripts"
+            fake_bin = root / "bin"
+            scripts.mkdir()
+            fake_bin.mkdir()
+            self._write_executable(
+                scripts / "run-claude-logged.sh",
+                (ROOT / "scripts/run-claude-logged.sh").read_text(encoding="utf-8"),
+            )
+            (scripts / "github_init.sh").write_text(
+                "export GITHUB_TOKEN=phase2-test-token\n"
+                "export GITHUB_MIRROR=https://mirror.invalid/\n",
+                encoding="utf-8",
+            )
+            self._write_executable(
+                fake_bin / "python3",
+                "#!/usr/bin/env bash\n"
+                "if [[ -n ${GITHUB_TOKEN:-} ]]; then token=set; else token=unset; fi\n"
+                "printf '%s|%s\\n' \"$token\" \"${GITHUB_MIRROR:-unset}\"\n",
+            )
+            environment = os.environ.copy()
+            environment["PATH"] = f"{fake_bin}:{environment.get('PATH', '')}"
+            environment.pop("GITHUB_TOKEN", None)
+            environment.pop("GITHUB_MIRROR", None)
+
+            skillnet_result = subprocess.run(
+                [
+                    scripts / "run-claude-logged.sh",
+                    "skillnet-research",
+                    "seed-a",
+                    "prompt.md",
+                ],
+                env=environment,
+                check=True,
+                text=True,
+                capture_output=True,
+            )
+            brainstorm_result = subprocess.run(
+                [
+                    scripts / "run-claude-logged.sh",
+                    "seed-brainstorm",
+                    "seed-a",
+                    "prompt.md",
+                ],
+                env=environment,
+                check=True,
+                text=True,
+                capture_output=True,
+            )
+
+        self.assertEqual(skillnet_result.stdout, "set|https://mirror.invalid/\n")
+        self.assertEqual(brainstorm_result.stdout, "unset|unset\n")
+
+    def test_skillnet_github_environment_reaches_claude_bash_child(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            scripts = root / "scripts"
+            claude_binary = root / "cc-binary/claude-test"
+            prompt = root / "prompts/skillnet-research.md"
+            brainstorm = root / "runs/brainstorm/seed-a/seed_brainstorm.json"
+
+            shutil.copytree(ROOT / "src", root / "src")
+            scripts.mkdir()
+            self._write_executable(
+                scripts / "run-claude-logged.sh",
+                (ROOT / "scripts/run-claude-logged.sh").read_text(encoding="utf-8"),
+            )
+            (scripts / "github_init.sh").write_text(
+                "export GITHUB_TOKEN=phase2-test-token\n"
+                "export GITHUB_MIRROR=https://mirror.invalid/\n",
+                encoding="utf-8",
+            )
+            prompt.parent.mkdir()
+            prompt.write_text("test prompt\n", encoding="utf-8")
+            brainstorm.parent.mkdir(parents=True)
+            brainstorm.write_text("{}\n", encoding="utf-8")
+            claude_binary.parent.mkdir()
+            self._write_executable(
+                claude_binary,
+                "#!/usr/bin/env bash\n"
+                "set -euo pipefail\n"
+                "bash -c '\n"
+                "  set -euo pipefail\n"
+                "  [[ ${GITHUB_TOKEN:-} == phase2-test-token ]]\n"
+                "  [[ ${GITHUB_MIRROR:-} == https://mirror.invalid/ ]]\n"
+                "  mkdir -p output/skillnet\n"
+                "  printf \"inherited\\n\" > output/skillnet/bash-child-env.txt\n"
+                "'\n",
+            )
+            write_model_config(
+                root,
+                {
+                    "claude_code_path": "cc-binary/claude-test",
+                    "claude_code_timeout_sec": 10,
+                },
+            )
+            environment = os.environ.copy()
+            environment["TASKGEN_OPENAI_GATEWAY_ACTIVE"] = "1"
+            environment.pop("GITHUB_TOKEN", None)
+            environment.pop("GITHUB_MIRROR", None)
+            environment.pop("_TASKGEN_PARENT_PHASE_SUBJECT_LOCK", None)
+
+            result = subprocess.run(
+                [
+                    scripts / "run-claude-logged.sh",
+                    "skillnet-research",
+                    "seed-a",
+                    prompt,
+                ],
+                env=environment,
+                check=False,
+                text=True,
+                capture_output=True,
+            )
+
+            marker = root / "runs/skillnet/seed-a/bash-child-env.txt"
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(marker.read_text(encoding="utf-8"), "inherited\n")
+
+    @unittest.skipUnless(
+        os.environ.get("TASKGEN_RUN_LIVE_CC_ENV_TEST") == "1",
+        "set TASKGEN_RUN_LIVE_CC_ENV_TEST=1 to call the configured Claude backend",
+    )
+    def test_live_claude_bash_tool_inherits_github_environment(self) -> None:
+        model_config = json.loads((ROOT / "model.json").read_text(encoding="utf-8"))
+        configured_claude_path = model_config.get("claude_code_path")
+        claude_binary: str | None = None
+        if isinstance(configured_claude_path, str):
+            claude_path = Path(configured_claude_path)
+            if not claude_path.is_absolute():
+                claude_path = ROOT / claude_path
+            if claude_path.is_file() and os.access(claude_path, os.X_OK):
+                claude_binary = str(claude_path)
+        if claude_binary is None:
+            claude_binary = shutil.which("claude")
+        self.assertIsNotNone(claude_binary, "claude CLI is not available")
+        self.assertTrue((ROOT / "scripts/github_init.sh").is_file())
+
+        live_backend = os.environ.get("TASKGEN_LIVE_CC_BACKEND", "claude")
+        self.assertIn(live_backend, {"claude", "openai"})
+        if live_backend == "openai":
+            configured_model = model_config.get("openai", {}).get("openai_default_model", "")
+            gateway_context = openai_gateway(configured_model)
+        else:
+            configured_model = model_config.get("default_model", "")
+            gateway_context = nullcontext()
+        self.assertIsInstance(configured_model, str)
+
+        with gateway_context, tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            fake_bin = root / "bin"
+            fake_bin.mkdir()
+            self._write_executable(
+                fake_bin / "python3",
+                "#!/usr/bin/env bash\n"
+                "set -euo pipefail\n"
+                "model_args=()\n"
+                "if [[ -n ${TASKGEN_LIVE_CC_MODEL:-} ]]; then\n"
+                "  model_args=(--model \"${TASKGEN_LIVE_CC_MODEL}\")\n"
+                "fi\n"
+                "exec \"${TASKGEN_LIVE_CC_BIN}\" --verbose "
+                "--output-format=stream-json --no-session-persistence "
+                "--allowedTools Bash --effort low "
+                "--max-budget-usd 0.25 \"${model_args[@]}\" --print -- "
+                "'Use the Bash tool exactly once. Run this exact command without "
+                "modification: if [[ -n \"${GITHUB_TOKEN:-}\" ]]; then printf "
+                "\"%s\\n\" TASKGEN_CC_CHILD_GITHUB_ENV_PRESENT; else printf "
+                "\"%s\\n\" TASKGEN_CC_CHILD_GITHUB_ENV_MISSING; fi. After the "
+                "tool finishes, reply briefly.'\n",
+            )
+            environment = os.environ.copy()
+            environment["PATH"] = f"{fake_bin}:{environment.get('PATH', '')}"
+            environment["TASKGEN_LIVE_CC_BIN"] = str(claude_binary)
+            environment["TASKGEN_LIVE_CC_MODEL"] = configured_model
+            environment["CLAUDE_CONFIG_DIR"] = str(root / "claude-config")
+            environment["CLAUDE_CODE_MAX_OUTPUT_TOKENS"] = "4096"
+            environment["MAX_THINKING_TOKENS"] = "0"
+            if live_backend == "claude":
+                environment.pop("TASKGEN_OPENAI_GATEWAY_ACTIVE", None)
+            environment.pop("GITHUB_TOKEN", None)
+            environment.pop("GITHUB_MIRROR", None)
+
+            result = subprocess.run(
+                [
+                    ROOT / "scripts/run-claude-logged.sh",
+                    "skillnet-research",
+                    "live-env-test",
+                    "unused-prompt.md",
+                ],
+                cwd=root,
+                env=environment,
+                check=False,
+                text=True,
+                capture_output=True,
+                timeout=180,
+            )
+
+        saw_bash_call = False
+        tool_results: list[str] = []
+        api_error_statuses: list[object] = []
+        api_error_categories: set[str] = set()
+        for line in result.stdout.splitlines():
+            try:
+                payload = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if payload.get("type") == "result" and payload.get("is_error") is True:
+                api_error_statuses.append(payload.get("api_error_status", "unknown"))
+                error_text = str(payload.get("result", "")).lower()
+                for category in (
+                    "auth",
+                    "budget",
+                    "country",
+                    "credit",
+                    "forbidden",
+                    "max_tokens",
+                    "model",
+                    "permission",
+                    "policy",
+                    "rate",
+                    "region",
+                    "unsupported",
+                ):
+                    if category in error_text:
+                        api_error_categories.add(category)
+            message = payload.get("message")
+            if not isinstance(message, dict):
+                continue
+            content = message.get("content")
+            if not isinstance(content, list):
+                continue
+            for block in content:
+                if not isinstance(block, dict):
+                    continue
+                if block.get("type") == "tool_use" and block.get("name") == "Bash":
+                    saw_bash_call = True
+                if block.get("type") == "tool_result":
+                    tool_results.append(json.dumps(block.get("content"), ensure_ascii=False))
+
+        self.assertEqual(
+            result.returncode,
+            0,
+            "live Claude Code smoke test failed before Bash environment verification; "
+            f"API statuses: {api_error_statuses}; categories: {sorted(api_error_categories)}",
+        )
+        self.assertTrue(saw_bash_call, "live Claude Code did not invoke its Bash tool")
+        combined_results = "\n".join(tool_results)
+        self.assertTrue(
+            "TASKGEN_CC_CHILD_GITHUB_ENV_PRESENT" in combined_results,
+            "the live Bash tool did not confirm the GitHub environment",
+        )
+        self.assertFalse(
+            "TASKGEN_CC_CHILD_GITHUB_ENV_MISSING" in combined_results,
+            "the live Bash tool reported a missing GitHub environment",
+        )
 
     def test_child_wrappers_do_not_overwrite_active_gateway_environment(self) -> None:
         for wrapper_name in ("run-claude-logged.sh", "run-harbor-oracle-nop.sh"):

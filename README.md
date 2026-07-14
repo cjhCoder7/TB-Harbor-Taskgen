@@ -77,6 +77,8 @@ Install the local Harbor, SkillNet, and LiteLLM tools with the `uv`-based helper
 scripts/tool_init.sh
 ```
 
+For authenticated SkillNet downloads in phase2, create the optional local GitHub configuration described under [SkillNet GitHub downloads](#skillnet-github-downloads).
+
 Before the first model-backed run, finish the binary and provider setup under [Configuration](#configuration).
 
 Check the available phases:
@@ -176,7 +178,7 @@ flowchart LR
 └── pyproject.toml
 ```
 
-`scripts/taskgen.sh` loads the selected local provider environment, sets `PYTHONPATH=src`, and delegates to the Python package.
+`scripts/taskgen.sh` loads the selected local provider environment, sets `PYTHONPATH=src`, and delegates to the Python package. The phase2 Claude launcher separately loads its local GitHub download environment when configured.
 
 ## Configuration
 
@@ -234,6 +236,19 @@ mkdir -p "$CLAUDE_BIN_DIR" && curl -fsSL "https://downloads.claude.ai/claude-cod
 ```
 
 If you downloaded the binary to a non-default path, update `claude_code_path` in `model.json` to match. `CLAUDE_PLATFORM` must match the machine that runs the pipeline; common values include `linux-x64`, `linux-arm64`, `linux-x64-musl`, and `linux-arm64-musl`.
+
+### SkillNet GitHub downloads
+
+Phase2 can authenticate its SkillNet downloads against GitHub without exposing the credential to other Claude phases. Create the ignored local file and set a dedicated, least-privilege token:
+
+```bash
+cp scripts/github_init.example.sh scripts/github_init.sh
+chmod 600 scripts/github_init.sh
+```
+
+`scripts/run-claude-logged.sh` loads this file only for `skillnet-research`, with either model backend, so the token is available to that phase's Claude Code process and Bash tools. `GITHUB_TOKEN` raises GitHub API limits and can authorize private repositories; never place its real value in the example, commits, prompts, or logs.
+
+The example also documents an optional raw-content mirror. Leave it unset unless the host is fully trusted: with the pinned SkillNet version, an authenticated download may send the GitHub authorization header to that mirror, and the mirror does not replace GitHub API authentication.
 
 ### Claude backend
 
