@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import signal
 import shutil
 import subprocess
@@ -27,6 +28,7 @@ from taskgen.claude.cost import format_cost_summary
 from taskgen.claude.cost import summarize_claude_stream_log
 from taskgen.claude.runner import build_claude_command, run_claude_logged, run_claude_process
 from taskgen.claude.workspace import (
+    CLAUDE_PERMISSION_DENY_RULES,
     MissingWorkspaceOutputsError,
     WorkspaceOutputError,
     output_path_sha256,
@@ -94,6 +96,18 @@ from taskgen.phases.phase7_finalize import (
     run_phase7_locked,
     validate_phase7,
 )
+
+
+def pinned_claude_bash_permission_match(rule: str, command: str) -> bool:
+    """Model simple wildcard matching in the project's pinned Claude Code."""
+
+    prefix = "Bash("
+    if not rule.startswith(prefix) or not rule.endswith(")"):
+        raise ValueError(f"not a scoped Bash permission rule: {rule}")
+    pattern = rule[len(prefix) : -1]
+
+    regex = "".join(".*" if character == "*" else re.escape(character) for character in pattern)
+    return re.fullmatch(regex, command, flags=re.DOTALL) is not None
 
 
 def write_fake_claude_session(project: Path, phase: str, subject: str, run_id: str = "run-1") -> str:
@@ -405,7 +419,7 @@ class ModelConfigTests(unittest.TestCase):
 
 
 class ClaudeRunnerTests(unittest.TestCase):
-    def test_claude_command_blocks_full_filesystem_scans(self) -> None:
+    def test_claude_command_does_not_duplicate_workspace_restrictions(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             binary = root / "cc-binary/claude-test"
@@ -419,15 +433,10 @@ class ClaudeRunnerTests(unittest.TestCase):
 
             command = build_claude_command(root, "claude-opus-4-8", "high", "prompt")
 
-        self.assertIn("--disallowedTools", command)
-        self.assertIn("Bash(*find / *)", command)
-        self.assertIn("Bash(*grep -R / *)", command)
-        self.assertIn("Bash(*rg --files / *)", command)
-        self.assertIn("Bash(*locate *)", command)
-        self.assertIn("Bash(git worktree *)", command)
-        self.assertIn("Bash(* git worktree *)", command)
-        self.assertIn("EnterWorktree", command)
-        self.assertLess(command.index("--disallowedTools"), command.index("--print"))
+        self.assertNotIn("--disallowedTools", command)
+        self.assertNotIn("--disallowed-tools", command)
+        self.assertIn("--permission-mode", command)
+        self.assertLess(command.index("--permission-mode"), command.index("--print"))
 
     def test_run_claude_passes_phase_timeout_override_to_subprocess(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -639,6 +648,108 @@ class ClaudeRunnerTests(unittest.TestCase):
                 )
             finally:
                 force_kill_processes(pid_paths)
+
+
+class ClaudePermissionPolicyTests(unittest.TestCase):
+    def matching_rules(self, command: str) -> list[str]:
+        return [
+            rule
+            for rule in CLAUDE_PERMISSION_DENY_RULES
+            if pinned_claude_bash_permission_match(rule, command)
+        ]
+
+    def test_deny_rules_are_unique_and_keep_bash_available(self) -> None:
+        self.assertEqual(
+            len(CLAUDE_PERMISSION_DENY_RULES),
+            len(set(CLAUDE_PERMISSION_DENY_RULES)),
+        )
+        for rule in CLAUDE_PERMISSION_DENY_RULES:
+            with self.subTest(rule=rule):
+                self.assertTrue(rule.startswith("Bash("))
+                self.assertTrue(rule.endswith(")"))
+                self.assertNotEqual(rule, "Bash(*)")
+        self.assertNotIn("Bash", CLAUDE_PERMISSION_DENY_RULES)
+
+    def test_deny_rules_cover_full_filesystem_parent_and_worktree_commands(self) -> None:
+        commands = (
+            "find /",
+            "find / -xdev -type f",
+            "/usr/bin/find / -maxdepth 2",
+            "find -L / -type f",
+            "find -- /",
+            "grep -R needle /",
+            "grep -r needle / --exclude-dir proc",
+            "grep --recursive needle /",
+            "grep needle -R /",
+            "grep needle / -R",
+            "rg needle /",
+            "rg --files /",
+            "du /",
+            "du -ah /",
+            "ls -R /",
+            "ls -laR /",
+            "ls --recursive /",
+            "ls / -R",
+            "ls -l / --recursive",
+            "find ..",
+            "find ../sibling -type f",
+            "find -L .. -type f",
+            "grep -R needle ..",
+            "grep --recursive needle ../sibling",
+            "rg --files ..",
+            "rg needle ../sibling",
+            "du ..",
+            "du -sh ../sibling",
+            "ls -R ..",
+            "ls --recursive ../sibling",
+            "ls .. -R",
+            "ls -l ../sibling --recursive",
+            "locate",
+            "locate settings.json",
+            "git worktree list",
+            "env git worktree add ../agent",
+            "/usr/bin/git worktree remove ../agent",
+            "git -C . worktree add ../agent",
+            "git --no-pager worktree list",
+            "git -c foo.bar=baz worktree add ../agent",
+            "git -C . --no-pager worktree list",
+            "/usr/bin/git --git-dir=.git worktree list",
+        )
+        for command in commands:
+            with self.subTest(command=command):
+                self.assertTrue(
+                    self.matching_rules(command),
+                    f"no deny rule matched {command!r}",
+                )
+
+    def test_deny_rules_do_not_block_normal_workspace_commands(self) -> None:
+        commands = (
+            "pwd",
+            "find . -maxdepth 2 -type f",
+            "find inputs -type f",
+            "grep -R needle .",
+            "grep --recursive needle inputs",
+            "rg needle .",
+            "rg --files .",
+            "du -sh .",
+            "ls -R output",
+            "ls output -R",
+            "git status",
+            "git --no-pager status",
+            "git -C . status",
+            "git log worktree",
+            "git diff -- worktree",
+            "git show worktree",
+            "git worktree-helper --help",
+            "python3 helper.py",
+        )
+        for command in commands:
+            with self.subTest(command=command):
+                self.assertEqual(
+                    self.matching_rules(command),
+                    [],
+                    f"workspace command was unexpectedly denied: {command!r}",
+                )
 
 
 class ClaudeWorktreeGuardTests(unittest.TestCase):
@@ -982,17 +1093,47 @@ class ClaudeWorkspaceTests(unittest.TestCase):
             self.assertFalse((project / ".claude").exists())
 
             settings = json.loads(settings_path.read_text(encoding="utf-8"))
+            self.assertEqual(set(settings), {"permissions", "hooks"})
+            self.assertEqual(set(settings["permissions"]), {"deny"})
+            deny_rules = settings["permissions"]["deny"]
+            self.assertEqual(deny_rules, list(CLAUDE_PERMISSION_DENY_RULES))
+            for rule in (
+                "Bash(*find * /)",
+                "Bash(*find * / *)",
+                "Bash(*grep * /)",
+                "Bash(*rg * / *)",
+                "Bash(*du * / *)",
+                "Bash(*ls *--recursive* / *)",
+                "Bash(*find * ..)",
+                "Bash(*find * ../*)",
+                "Bash(*grep * ../*)",
+                "Bash(*rg * ../*)",
+                "Bash(*du * ../*)",
+                "Bash(*ls -*R* ../*)",
+                "Bash(*/git worktree *)",
+                "Bash(git -* worktree *)",
+            ):
+                self.assertIn(rule, deny_rules)
+            self.assertNotIn("EnterWorktree", deny_rules)
             pre_tool_use = settings["hooks"]["PreToolUse"]
+            self.assertEqual(len(pre_tool_use), 1)
             self.assertEqual(pre_tool_use[0]["matcher"], "Agent|Task|EnterWorktree")
             handler = pre_tool_use[0]["hooks"][0]
-            self.assertEqual(handler["command"], sys.executable)
-            self.assertEqual(handler["args"], [str(guard_path)])
+            self.assertEqual(
+                handler,
+                {
+                    "type": "command",
+                    "command": sys.executable,
+                    "args": [str(guard_path)],
+                    "timeout": 5,
+                },
+            )
             self.assertEqual(
                 settings["hooks"]["WorktreeCreate"][0]["hooks"][0],
                 handler,
             )
 
-    def test_workspace_guard_exec_form_handles_special_characters_in_path(self) -> None:
+    def test_generated_guard_enforces_policy_from_path_with_special_characters(self) -> None:
         with tempfile.TemporaryDirectory() as project_tmp:
             project = Path(project_tmp) / "project with spaces [guard]"
             (project / "prompts").mkdir(parents=True)
@@ -1004,26 +1145,69 @@ class ClaudeWorkspaceTests(unittest.TestCase):
             workspace = Path(str(payload["workspace_dir"]))
             settings_path = Path(str(payload["claude_settings_path"]))
             settings = json.loads(settings_path.read_text(encoding="utf-8"))
-            handler = settings["hooks"]["PreToolUse"][0]["hooks"][0]
-            result = subprocess.run(
-                [handler["command"], *handler["args"]],
-                input=json.dumps(
-                    {
-                        "hook_event_name": "PreToolUse",
-                        "tool_name": "Agent",
-                        "tool_input": {"isolation": "worktree", "prompt": "work"},
-                    }
-                ),
-                text=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                cwd=workspace,
-                check=False,
-            )
+            pre_tool_handler = settings["hooks"]["PreToolUse"][0]["hooks"][0]
+            worktree_create_handler = settings["hooks"]["WorktreeCreate"][0]["hooks"][0]
 
-            self.assertEqual(result.returncode, 0, result.stderr)
-            output = json.loads(result.stdout)["hookSpecificOutput"]
-            self.assertEqual(output["updatedInput"], {"prompt": "work"})
+            def run_handler(
+                handler: dict[str, object],
+                hook_input: dict[str, object],
+            ) -> subprocess.CompletedProcess[str]:
+                command = handler["command"]
+                arguments = handler["args"]
+                self.assertIsInstance(command, str)
+                self.assertIsInstance(arguments, list)
+                return subprocess.run(
+                    [command, *arguments],
+                    input=json.dumps(hook_input),
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    cwd=workspace,
+                    check=False,
+                )
+
+            agent_result = run_handler(
+                pre_tool_handler,
+                {
+                    "hook_event_name": "PreToolUse",
+                    "tool_name": "Agent",
+                    "tool_input": {"isolation": "worktree", "prompt": "work"},
+                },
+            )
+            self.assertEqual(agent_result.returncode, 0, agent_result.stderr)
+            agent_output = json.loads(agent_result.stdout)["hookSpecificOutput"]
+            self.assertEqual(agent_output["permissionDecision"], "allow")
+            self.assertEqual(agent_output["updatedInput"], {"prompt": "work"})
+
+            enter_result = run_handler(
+                pre_tool_handler,
+                {
+                    "hook_event_name": "PreToolUse",
+                    "tool_name": "EnterWorktree",
+                    "tool_input": {},
+                },
+            )
+            self.assertEqual(enter_result.returncode, 0, enter_result.stderr)
+            enter_output = json.loads(enter_result.stdout)["hookSpecificOutput"]
+            self.assertEqual(enter_output["permissionDecision"], "deny")
+
+            unrelated_result = run_handler(
+                pre_tool_handler,
+                {
+                    "hook_event_name": "PreToolUse",
+                    "tool_name": "Bash",
+                    "tool_input": {"command": "pwd"},
+                },
+            )
+            self.assertEqual(unrelated_result.returncode, 0, unrelated_result.stderr)
+            self.assertEqual(unrelated_result.stdout, "")
+
+            create_result = run_handler(
+                worktree_create_handler,
+                {"hook_event_name": "WorktreeCreate", "name": "agent-test"},
+            )
+            self.assertEqual(create_result.returncode, 2)
+            self.assertIn("blocks Claude Code worktree creation", create_result.stderr)
 
     def test_skillnet_research_outputs_seed_directory(self) -> None:
         self.assertEqual(

@@ -39,19 +39,6 @@ from taskgen.config import (
 
 
 PERMISSION_ARGS = ("--permission-mode", "bypassPermissions")
-DISALLOWED_TOOL_ARGS = (
-    "--disallowedTools",
-    "Bash(*find / *)",
-    "Bash(*find /)",
-    "Bash(*grep -R / *)",
-    "Bash(*grep -r / *)",
-    "Bash(*rg / *)",
-    "Bash(*rg --files / *)",
-    "Bash(*locate *)",
-    "Bash(git worktree *)",
-    "Bash(* git worktree *)",
-    "EnterWorktree",
-)
 TIMEOUT_EXIT_CODE = 124
 OUTPUT_SYNC_EXIT_CODE = 1
 
@@ -112,7 +99,6 @@ def build_claude_command(
         command.extend(["--model", model])
     if effort:
         command.extend(["--effort", effort])
-    command.extend(DISALLOWED_TOOL_ARGS)
     command.extend([*PERMISSION_ARGS, "--print", "--", prompt])
     return command
 

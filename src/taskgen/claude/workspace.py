@@ -36,6 +36,79 @@ SUPPORTED_PHASES = {
 CLAUDE_DEFINITIONS_DIR = "cc-definitions"
 WORKTREE_GUARD_FILENAME = "taskgen-worktree-guard.py"
 WORKTREE_GUARD_SETTINGS_FILENAME = "settings.json"
+# Claude Code 2.1.169 needs explicit pairs for an exact command ending and the
+# same prefix followed by more arguments; keep both forms while it is pinned.
+CLAUDE_PERMISSION_DENY_RULES = (
+    # Full-filesystem scans.
+    "Bash(*find /)",
+    "Bash(*find / *)",
+    "Bash(*find * /)",
+    "Bash(*find * / *)",
+    "Bash(*grep * /)",
+    "Bash(*grep * / *)",
+    "Bash(*rg * /)",
+    "Bash(*rg * / *)",
+    "Bash(*du /)",
+    "Bash(*du / *)",
+    "Bash(*du * /)",
+    "Bash(*du * / *)",
+    "Bash(*ls -*R* /)",
+    "Bash(*ls -*R* / *)",
+    "Bash(*ls *--recursive* /)",
+    "Bash(*ls *--recursive* / *)",
+    "Bash(*ls / *-*R*)",
+    "Bash(*ls * / *-*R*)",
+    "Bash(*ls / *--recursive*)",
+    "Bash(*ls * / *--recursive*)",
+    # Parent-directory scans from the isolated workspace.
+    "Bash(*find ..)",
+    "Bash(*find .. *)",
+    "Bash(*find ../*)",
+    "Bash(*find * ..)",
+    "Bash(*find * .. *)",
+    "Bash(*find * ../*)",
+    "Bash(*grep * ..)",
+    "Bash(*grep * .. *)",
+    "Bash(*grep * ../*)",
+    "Bash(*rg * ..)",
+    "Bash(*rg * .. *)",
+    "Bash(*rg * ../*)",
+    "Bash(*du ..)",
+    "Bash(*du .. *)",
+    "Bash(*du ../*)",
+    "Bash(*du * ..)",
+    "Bash(*du * .. *)",
+    "Bash(*du * ../*)",
+    "Bash(*ls -*R* ..)",
+    "Bash(*ls -*R* .. *)",
+    "Bash(*ls -*R* ../*)",
+    "Bash(*ls *--recursive* ..)",
+    "Bash(*ls *--recursive* .. *)",
+    "Bash(*ls *--recursive* ../*)",
+    "Bash(*ls .. *-*R*)",
+    "Bash(*ls * .. *-*R*)",
+    "Bash(*ls ../* -*R*)",
+    "Bash(*ls * ../* -*R*)",
+    "Bash(*ls .. *--recursive*)",
+    "Bash(*ls * .. *--recursive*)",
+    "Bash(*ls ../* *--recursive*)",
+    "Bash(*ls * ../* *--recursive*)",
+    # System-wide path lookup and direct Git worktree commands.
+    "Bash(*locate)",
+    "Bash(*locate *)",
+    "Bash(git worktree)",
+    "Bash(git worktree *)",
+    "Bash(* git worktree)",
+    "Bash(* git worktree *)",
+    "Bash(*/git worktree)",
+    "Bash(*/git worktree *)",
+    "Bash(git -* worktree)",
+    "Bash(git -* worktree *)",
+    "Bash(* git -* worktree)",
+    "Bash(* git -* worktree *)",
+    "Bash(*/git -* worktree)",
+    "Bash(*/git -* worktree *)",
+)
 
 
 class WorkspaceOutputError(RuntimeError):
@@ -136,7 +209,7 @@ def write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
 
 
 def install_worktree_guard(workspace: Path) -> tuple[Path, Path]:
-    """Install a per-run Claude hook that keeps subagents in ``workspace``."""
+    """Install per-run permissions and the hook that keeps agents in ``workspace``."""
 
     source = Path(__file__).with_name("worktree_guard.py")
     unsafe_reason = unsafe_copy_source_reason(source)
@@ -158,6 +231,7 @@ def install_worktree_guard(workspace: Path) -> tuple[Path, Path]:
     write_json_atomic(
         settings_path,
         {
+            "permissions": {"deny": list(CLAUDE_PERMISSION_DENY_RULES)},
             "hooks": {
                 "PreToolUse": [
                     {
