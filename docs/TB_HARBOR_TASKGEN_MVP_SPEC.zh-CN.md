@@ -119,7 +119,7 @@ phase4 之后使用的稳定 task id 是：
 | `scripts/run-harbor-oracle-nop.sh` | 运行 Harbor oracle/nop 检查。 |
 | `scripts/clean-intermediate.sh` | 清理中间运行产物。 |
 | `scripts/github_init.example.sh` | Phase2 SkillNet 下载使用的本地 GitHub 环境模板。 |
-| `scripts/tool_init.sh` | 通过 `uv tool install` 安装 `harbor==0.13.2`、`skillnet-ai==0.0.18` 和 `litellm[proxy]==1.91.1`。 |
+| `scripts/tool_init.sh` | 通过 `uv tool install` 安装 `harbor==0.13.2`、`skillnet-ai==0.1.0` 和 `litellm[proxy]==1.91.1`。 |
 
 对应文件存在时，`scripts/taskgen.sh` 默认 source `scripts/env_init.sh`，传入 `--openai` 时改为 source `scripts/env_openai_init.sh`。Claude wrapper 还会仅在 phase 为 `skillnet-research` 时加载 `scripts/github_init.sh`，与模型后端无关。这些本地文件都被 git 忽略，并从各自的 `.example.sh` 创建。嵌套 wrapper 会保留已启用的网关环境；所有 wrapper 都会把 `src/` 加入 `PYTHONPATH`。
 

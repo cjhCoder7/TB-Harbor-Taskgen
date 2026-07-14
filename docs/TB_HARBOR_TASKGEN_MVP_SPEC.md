@@ -119,7 +119,7 @@ The optional `openai` values are selected only with `--openai`, but the object i
 | `scripts/run-harbor-oracle-nop.sh` | Runs Harbor oracle/nop checks. |
 | `scripts/clean-intermediate.sh` | Cleans intermediate runtime artifacts. |
 | `scripts/github_init.example.sh` | Templates the local GitHub environment used by phase2 SkillNet downloads. |
-| `scripts/tool_init.sh` | Installs `harbor==0.13.2`, `skillnet-ai==0.0.18`, and `litellm[proxy]==1.91.1` with `uv tool install`. |
+| `scripts/tool_init.sh` | Installs `harbor==0.13.2`, `skillnet-ai==0.1.0`, and `litellm[proxy]==1.91.1` with `uv tool install`. |
 
 When present, `scripts/taskgen.sh` sources `scripts/env_init.sh` by default or `scripts/env_openai_init.sh` with `--openai`. The Claude wrapper additionally sources `scripts/github_init.sh` only when its phase is `skillnet-research`, independent of the model backend. These local files are ignored by git and created from their corresponding `.example.sh` files. Nested wrappers preserve an active gateway environment, and all wrappers add `src/` to `PYTHONPATH`.
 
