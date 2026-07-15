@@ -36,6 +36,10 @@ SUPPORTED_PHASES = {
 CLAUDE_DEFINITIONS_DIR = "cc-definitions"
 WORKTREE_GUARD_FILENAME = "taskgen-worktree-guard.py"
 WORKTREE_GUARD_SETTINGS_FILENAME = "settings.json"
+CLAUDE_SETTINGS_ENV = {
+    "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
+    "CLAUDE_CODE_ATTRIBUTION_HEADER": "0",
+}
 # Claude Code 2.1.169 needs explicit pairs for an exact command ending and the
 # same prefix followed by more arguments; keep both forms while it is pinned.
 CLAUDE_PERMISSION_DENY_RULES = (
@@ -231,6 +235,7 @@ def install_worktree_guard(workspace: Path) -> tuple[Path, Path]:
     write_json_atomic(
         settings_path,
         {
+            "env": dict(CLAUDE_SETTINGS_ENV),
             "permissions": {"deny": list(CLAUDE_PERMISSION_DENY_RULES)},
             "hooks": {
                 "PreToolUse": [

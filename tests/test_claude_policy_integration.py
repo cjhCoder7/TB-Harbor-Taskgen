@@ -494,6 +494,45 @@ class ClaudePolicyIntegrationTests(unittest.TestCase):
                 with self.subTest(label=label):
                     self.assertEqual(marker.read_text(encoding="utf-8"), "ok")
 
+    def test_generated_settings_environment_reaches_bash_tools(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_name:
+            temporary = Path(temporary_name)
+            workspace = temporary / "workspace"
+            workspace.mkdir()
+            self._init_repository(workspace)
+            self._install_generated_settings(workspace)
+            marker = workspace / "settings-env-ok"
+
+            def respond(index: int, _request: dict[str, Any]) -> bytes:
+                if index == 0:
+                    command = (
+                        'test "${CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC:-}" = 1 '
+                        '&& test "${CLAUDE_CODE_ATTRIBUTION_HEADER:-}" = 0 '
+                        f"&& printf ok > {shlex.quote(str(marker))}"
+                    )
+                    return _tool_response(
+                        "msg_settings_env",
+                        "toolu_settings_env",
+                        "Bash",
+                        {
+                            "command": command,
+                            "description": "verify generated settings environment",
+                            "timeout": 5000,
+                        },
+                    )
+                return _text_response("msg_settings_env_done", "SETTINGS_ENV_DONE")
+
+            with _FakeAnthropicServer(respond) as server:
+                env = self._environment(temporary, server)
+                env.pop("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", None)
+                env.pop("CLAUDE_CODE_ATTRIBUTION_HEADER", None)
+                self._handoff_tree(temporary)
+                result = self._run(self._command(), cwd=workspace, env=env)
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(server.errors, [])
+            self.assertEqual(marker.read_text(encoding="utf-8"), "ok")
+
     def test_real_pre_tool_use_hooks_rewrite_task_and_deny_enter_worktree(self) -> None:
         def respond(index: int, _request: dict[str, Any]) -> bytes:
             if index == 0:

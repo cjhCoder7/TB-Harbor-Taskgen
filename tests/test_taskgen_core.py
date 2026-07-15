@@ -1248,7 +1248,14 @@ class ClaudeWorkspaceTests(unittest.TestCase):
             self.assertFalse((project / ".claude").exists())
 
             settings = json.loads(settings_path.read_text(encoding="utf-8"))
-            self.assertEqual(set(settings), {"permissions", "hooks"})
+            self.assertEqual(set(settings), {"env", "permissions", "hooks"})
+            self.assertEqual(
+                settings["env"],
+                {
+                    "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
+                    "CLAUDE_CODE_ATTRIBUTION_HEADER": "0",
+                },
+            )
             self.assertEqual(set(settings["permissions"]), {"deny"})
             deny_rules = settings["permissions"]["deny"]
             self.assertEqual(deny_rules, list(CLAUDE_PERMISSION_DENY_RULES))
