@@ -133,6 +133,25 @@ scripts/taskgen.sh run phase1 <seed_id> --openai
 
 对于模型 phase，`--model` 和 `--effort` 会覆盖 `model.json`。Pipeline 的 `--force` 会重跑已通过验证的 phase，`--continue-on-error` 会在一个 idea 失败后继续处理后续 ideas。
 
+### 命令默认值
+
+未显式覆盖时，当前流水线使用以下默认值：
+
+| 设置 | 默认值 | 行为 |
+| --- | --- | --- |
+| 后端（`--openai`） | 关闭 | 使用 Claude 后端；传入 `--openai` 后启用 OpenAI-compatible 后端。 |
+| Idea 数量（`--idea-count`） | 未设置 | Phase1 默认要求生成 3–5 个 ideas，但不强制精确数量。 |
+| Idea 选择（`--idea-id`） | 未设置 | `pipeline` 串行处理 phase1 的全部 ideas；单独运行 phase3–7 时必须指定 idea id。 |
+| Repair 上限（`--max-repairs`） | `2` | 每个 idea 最多执行两轮 phase6 repair。 |
+| 已通过验证的 phase（`--force`） | 关闭 | 从有效产物继续；上游 phase 本次运行后，重新运行对应下游 phase。 |
+| Idea 失败（`--continue-on-error`） | 关闭 | 第一个 idea 失败后停止流水线。 |
+| 预览（`--dry-run`） | 关闭 | 实际执行命令，而不只是打印命令。 |
+| 模型 | Claude：`claude-opus-4-8`；OpenAI-compatible：`gpt-5.4` | `--model` 会覆盖所选后端的默认模型。 |
+| Effort | Claude phase1/2/3/5/6：`max`/`medium`/`max`/`high`/`high`；OpenAI-compatible 五个 phase 均为 `xhigh` | `--effort` 会覆盖 phase 配置；phase4 和 phase7 不调用 Claude Code。 |
+| 超时 | Claude phase1/2/5：`1800` 秒；phase3/6 和每项 phase4 oracle/nop 检查：`10800` 秒 | Phase 配置优先于全局 Claude Code 超时。 |
+
+模型、effort、binary 和 timeout 默认值来自仓库中的 [`model.json`](model.json)；完整解析规则见[配置](#配置)。
+
 ## 流水线
 
 ```mermaid

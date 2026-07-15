@@ -133,6 +133,25 @@ scripts/taskgen.sh run phase1 <seed_id> --openai
 
 For model-backed phases, `--model` and `--effort` override `model.json`. Pipeline option `--force` reruns already-valid phases, while `--continue-on-error` continues with later ideas after one fails.
 
+### Command defaults
+
+Without explicit overrides, the current pipeline uses these defaults:
+
+| Setting | Default | Behavior |
+| --- | --- | --- |
+| Backend (`--openai`) | Off | Use the Claude backend; `--openai` enables the OpenAI-compatible backend. |
+| Idea count (`--idea-count`) | Not set | Phase1 requests 3–5 ideas without enforcing an exact count. |
+| Idea selection (`--idea-id`) | Not set | `pipeline` processes every phase1 idea sequentially; phases 3–7 require an idea id when run individually. |
+| Repair limit (`--max-repairs`) | `2` | Allow up to two phase6 repair rounds per idea. |
+| Existing valid phases (`--force`) | Off | Resume from valid outputs; rerun downstream phases when an upstream phase ran. |
+| Idea failure (`--continue-on-error`) | Off | Stop the pipeline after the first failed idea. |
+| Preview (`--dry-run`) | Off | Execute the selected command instead of only printing it. |
+| Model | Claude: `claude-opus-4-8`; OpenAI-compatible: `gpt-5.4` | `--model` overrides the selected backend default. |
+| Effort | Claude phases 1/2/3/5/6: `max`/`medium`/`max`/`high`/`high`; OpenAI-compatible: `xhigh` for all five | `--effort` overrides the phase value; phases 4 and 7 do not use Claude Code. |
+| Timeout | Claude phases 1/2/5: `1800` seconds; phases 3/6 and each phase4 oracle/nop check: `10800` seconds | Phase-specific values override the global Claude Code timeout. |
+
+Model, effort, binary, and timeout defaults come from the committed [`model.json`](model.json); see [Configuration](#configuration) for the full resolution rules.
+
 ## Pipeline
 
 ```mermaid
